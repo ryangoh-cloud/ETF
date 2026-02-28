@@ -7,6 +7,8 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -22,7 +24,7 @@ from etf_engine import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page config
+# Page configuration
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ETF Dashboard",
@@ -34,15 +36,13 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS  —  dark terminal theme
 # ─────────────────────────────────────────────────────────────────────────────
-
 st.markdown("""
     <style>
     .block-container {
-        padding-top: 2rem; /* Increase this value if needed (e.g., 3rem) */
+        padding-top: rem;
     }
     </style>
     """, unsafe_allow_html=True)
-
 
 st.markdown(
     """
@@ -141,14 +141,14 @@ st.markdown(
 with st.sidebar:
     st.markdown(
         '<p style="font-size:20px;font-weight:700;color:#e6edf3;letter-spacing:2px;">'
-        '📈 DASHBOARD CONTROLS </p>',
+        '📈 Dashboard Controls </p>',
         unsafe_allow_html=True,
     )
     st.markdown('<hr class="dim">', unsafe_allow_html=True)
 
     # ── Preset universe ───────────────────────────────────────────────────────
     st.markdown(
-        '<div class="card-label" style="margin-bottom:4px;">PRESET UNIVERSE</div>',
+        '<div class="card-label" style="margin-bottom:4px;">PRESET ETF </div>',
         unsafe_allow_html=True,
     )
     preset_ticker = st.selectbox(
@@ -224,20 +224,25 @@ if custom_clean and custom_clean not in ETF_UNIVERSE:
 # ─────────────────────────────────────────────────────────────────────────────
 # Cached analysis
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-ticker version counter — incrementing only invalidates the current ETF's
-# cache entry, leaving all other ETFs' results intact.
-if "ticker_versions" not in st.session_state:
-    st.session_state.ticker_versions = {}
+# Process-global version counter — shared across ALL concurrent sessions so
+# that (a) one user's refresh benefits everyone, and (b) the cache key space
+# stays bounded regardless of how many users are active.
+@st.cache_resource
+def _get_version_state() -> dict:
+    """Initialised once per process; persists for the lifetime of the server."""
+    return {"versions": {}, "lock": threading.Lock()}
+
+_vstate = _get_version_state()
 
 if refresh:
-    st.session_state.ticker_versions[ticker] = (
-        st.session_state.ticker_versions.get(ticker, 0) + 1
-    )
+    with _vstate["lock"]:
+        _vstate["versions"][ticker] = _vstate["versions"].get(ticker, 0) + 1
 
-_cache_v = st.session_state.ticker_versions.get(ticker, 0)
+with _vstate["lock"]:
+    _cache_v = _vstate["versions"].get(ticker, 0)
 
 
-@st.cache_data(ttl=3_600, show_spinner=False, max_entries=30)
+@st.cache_data(ttl=3_600, show_spinner=False, max_entries=50)
 def cached_analysis(sym: str, cache_v: int, _progress=None) -> dict | None:
     """_progress is excluded from the cache key (leading underscore)."""
     return run_analysis(sym, _progress=_progress)
@@ -246,6 +251,13 @@ def cached_analysis(sym: str, cache_v: int, _progress=None) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Progress bar  (shown only on first / refreshed computation, not on cache hits)
 # ─────────────────────────────────────────────────────────────────────────────
+# Trim stale _done_key entries from session state so it doesn't grow
+# unboundedly as the user switches tickers or the server version counter
+# advances (keep only the 20 most recently accessed entries).
+_done_keys = [k for k in st.session_state if k.startswith("_computed_")]
+for _stale in _done_keys[:-20]:
+    del st.session_state[_stale]
+
 _done_key = f"_computed_{ticker}_{_cache_v}"
 _already_computed = st.session_state.get(_done_key, False)
 
@@ -336,7 +348,7 @@ st.markdown(
     f"""
     <div style="display:flex;align-items:baseline;gap:18px;margin-bottom:4px;">
         <span style="font-size:22px;font-weight:800;color:#e6edf3;letter-spacing:2px;">
-            ETF REGIME TRADING DASHBOARD
+            ETF TRADING DASHBOARD
         </span>
         <span style="font-size:18px;color:#58a6ff;font-weight:700;">{ticker}</span>
         <span style="font-size:20px;color:#e6edf3;font-weight:600;">
@@ -758,7 +770,7 @@ st.markdown(
 if trades.empty:
     st.info(
         "No trades were executed in the 2-year lookback window.  "
-        "Bullish regime + positive composite signal was never triggered simultaneously."
+        "Bullish regimes + positive composite signal was never triggered simultaneously."
     )
 else:
     # ── Summary mini-metrics ──────────────────────────────────────────────────
