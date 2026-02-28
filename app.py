@@ -18,6 +18,7 @@ from etf_engine import (
     REGIME_COLORS,
     REGIME_PALETTE,
     run_analysis,
+    validate_ticker,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,14 +136,44 @@ with st.sidebar:
     )
     st.markdown('<hr class="dim">', unsafe_allow_html=True)
 
-    ticker = st.selectbox(
-        "ETF",
+    # ── Preset universe ───────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="card-label" style="margin-bottom:4px;">PRESET UNIVERSE</div>',
+        unsafe_allow_html=True,
+    )
+    preset_ticker = st.selectbox(
+        "Preset ETF",
         ETF_UNIVERSE,
         index=0,
         label_visibility="collapsed",
         key="ticker_select",
     )
-    st.caption(f"Universe: {' · '.join(ETF_UNIVERSE)}")
+
+    # ── Custom ticker ─────────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="card-label" style="margin-top:10px;margin-bottom:4px;">'
+        'CUSTOM TICKER (overrides preset)</div>',
+        unsafe_allow_html=True,
+    )
+    custom_input = st.text_input(
+        "Custom ticker",
+        value="",
+        placeholder="e.g. SPY, IWM, ARKK, GLD…",
+        label_visibility="collapsed",
+        key="custom_ticker_input",
+        max_chars=10,
+    )
+
+    # Resolve active ticker
+    custom_clean = custom_input.strip().upper()
+    ticker       = custom_clean if custom_clean else preset_ticker
+
+    if custom_clean:
+        st.markdown(
+            f'<div style="font-size:11px;color:#58a6ff;margin-top:2px;">'
+            f'Using custom: <b>{ticker}</b></div>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown('<hr class="dim">', unsafe_allow_html=True)
     st.markdown(
@@ -161,32 +192,101 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Ticker validation  (only for custom tickers — fast 5-day check)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3_600, show_spinner=False)
+def _cached_validate(sym: str) -> tuple[bool, str]:
+    return validate_ticker(sym)
+
+
+if custom_clean and custom_clean not in ETF_UNIVERSE:
+    with st.spinner(f"Validating {ticker}…"):
+        is_valid, err_msg = _cached_validate(ticker)
+    if not is_valid:
+        st.error(
+            f"**Invalid ticker: {ticker}**\n\n"
+            f"{err_msg}\n\n"
+            f"*Preset universe: {' · '.join(ETF_UNIVERSE)}*"
+        )
+        st.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Cached analysis
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-ticker version counter — incrementing only invalidates the current ETF's
 # cache entry, leaving all other ETFs' results intact.
 if "ticker_versions" not in st.session_state:
-    st.session_state.ticker_versions = {t: 0 for t in ETF_UNIVERSE}
+    st.session_state.ticker_versions = {}
 
 if refresh:
     st.session_state.ticker_versions[ticker] = (
         st.session_state.ticker_versions.get(ticker, 0) + 1
     )
 
-
-@st.cache_data(ttl=3_600, show_spinner=False, max_entries=len(ETF_UNIVERSE) * 3)
-def cached_analysis(sym: str, cache_v: int) -> dict | None:
-    return run_analysis(sym)
-
-
 _cache_v = st.session_state.ticker_versions.get(ticker, 0)
-with st.spinner(f"Analysing {ticker} — first run may take ~20 s …"):
+
+
+@st.cache_data(ttl=3_600, show_spinner=False, max_entries=30)
+def cached_analysis(sym: str, cache_v: int, _progress=None) -> dict | None:
+    """_progress is excluded from the cache key (leading underscore)."""
+    return run_analysis(sym, _progress=_progress)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Progress bar  (shown only on first / refreshed computation, not on cache hits)
+# ─────────────────────────────────────────────────────────────────────────────
+_done_key = f"_computed_{ticker}_{_cache_v}"
+_already_computed = st.session_state.get(_done_key, False)
+
+_progress_slot = st.empty()   # single placeholder — cleared after computation
+
+if not _already_computed:
+    # Build the staged progress UI inside the placeholder
+    with _progress_slot.container():
+        st.markdown(
+            f'<div class="card-label" style="margin-bottom:6px;">'
+            f'RUNNING ANALYSIS — {ticker}</div>',
+            unsafe_allow_html=True,
+        )
+        _pbar = st.progress(0, text="Initialising…")
+        _status_txt = st.empty()
+
+    def _progress_callback(pct: int, msg: str) -> None:
+        _pbar.progress(
+            min(pct, 100) / 100,
+            text=f"{'✅' if pct >= 100 else '⏳'}  {msg}",
+        )
+        stage = (
+            f"Step {max(1, round(pct / 100 * 6))}/6"
+            if pct < 100 else "Complete"
+        )
+        _status_txt.markdown(
+            f'<div style="font-size:10px;color:#8b949e;font-family:monospace;">'
+            f'{stage} · {pct}%</div>',
+            unsafe_allow_html=True,
+        )
+
+    result = cached_analysis(ticker, _cache_v, _progress_callback)
+
+    if result is not None:
+        st.session_state[_done_key] = True   # mark as computed for this session
+
+else:
+    # Cache hit — no progress bar needed, return immediately
     result = cached_analysis(ticker, _cache_v)
 
+_progress_slot.empty()   # always clear — either after compute or instant
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Error handling
+# ─────────────────────────────────────────────────────────────────────────────
 if result is None:
     st.error(
-        f"**{ticker}** — insufficient data or download error.  "
-        "The ETF may be too new or temporarily unavailable."
+        f"**{ticker}** — analysis failed.  \n\n"
+        "Possible causes: insufficient price history (< 2 years), "
+        "the symbol is not a US-listed instrument, or a temporary data error.  \n\n"
+        f"*Preset universe: {' · '.join(ETF_UNIVERSE)}*"
     )
     st.stop()
 

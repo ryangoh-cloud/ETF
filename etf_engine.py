@@ -47,6 +47,31 @@ def fetch_data(ticker: str, period: str = "3y") -> pd.DataFrame:
     return df
 
 
+def validate_ticker(ticker: str) -> tuple[bool, str]:
+    """
+    Quick pre-flight check: does the ticker exist and return recent price data?
+    Uses a 5-day history pull — minimal data transfer, fast response.
+
+    Returns (is_valid, error_message).  error_message is "" on success.
+    """
+    sym = ticker.strip().upper()
+    if not sym:
+        return False, "Ticker symbol cannot be empty."
+    try:
+        t  = yf.Ticker(sym)
+        df = t.history(period="5d")
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        if df.empty or len(df) < 2:
+            return False, (
+                f"**{sym}** returned no price data. "
+                "The symbol may be delisted, misspelled, or not traded on a US exchange."
+            )
+        return True, ""
+    except Exception as exc:
+        return False, f"Network or API error while validating **{sym}**: {exc}"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # HMM Features
 # ──────────────────────────────────────────────────────────────────────────────
@@ -405,27 +430,32 @@ def generate_trades(df: pd.DataFrame, position: pd.Series) -> pd.DataFrame:
 # Main Pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_analysis(ticker: str) -> dict | None:
+def run_analysis(ticker: str, _progress=None) -> dict | None:
     """
-    Full pipeline for one ETF ticker:
-      1. Fetch 3 years of OHLCV (extra year for indicator warm-up)
-      2. Compute HMM features → fit 5-state GaussianHMM → label regimes
-      3. Compute 5 technical signals
-      4. Optimise signal weights (max Sharpe) on 2-year lookback window
-      5. Backtest and compute metrics on 2-year window
-      6. Generate trade blotter
-      7. Derive current recommendation
+    Full pipeline for one ETF ticker.
+
+    _progress : optional callable(pct: int, msg: str) for live UI updates.
+                The leading underscore tells Streamlit's @st.cache_data to
+                exclude this argument from the cache key, so the same cached
+                result is served regardless of which callback is passed.
     """
+    def _upd(pct: int, msg: str) -> None:
+        if _progress is not None:
+            _progress(pct, msg)
+
     try:
-        df = fetch_data(ticker)          # default period="3y"
+        _upd(5,  f"Downloading {ticker} price history (3 years)…")
+        df = fetch_data(ticker)
         if len(df) < 60:
             return None
 
-        # ── Regime detection on full history ──────────────────────────────
+        _upd(18, "Computing HMM features (returns · range · vol)…")
         features = compute_features(df)
+
+        _upd(30, "Fitting Gaussian HMM · 5 hidden states…")
         model, regimes, regime_map, scaler = fit_hmm(features)
 
-        # ── Technical signals on full history ─────────────────────────────
+        _upd(45, "Computing signals: RSI · Momentum · Vol · ADX · EMA…")
         signals = compute_signals(df)
 
         # ── 2-year lookback window ─────────────────────────────────────────
@@ -437,43 +467,35 @@ def run_analysis(ticker: str) -> dict | None:
         if len(df_lb) < 60:
             return None
 
-        # ── Weight optimisation on 2-year window ──────────────────────────
+        _upd(58, "Optimising signal weights · maximising Sharpe ratio…")
         weights = optimize_weights(df_lb, regimes_lb, signals_lb)
 
-        # ── Backtest ──────────────────────────────────────────────────────
+        _upd(82, "Backtesting strategy on 2-year window…")
         strat_returns, position = backtest(df_lb, regimes_lb, signals_lb, weights)
         metrics = compute_metrics(strat_returns)
         trades  = generate_trades(df_lb, position)
 
-        # ── Current regime & signals ───────────────────────────────────────
+        _upd(93, "Computing regime transition probabilities…")
         current_regime   = str(regimes.iloc[-1])
         current_sig_vals = signals.iloc[-1].values
         w_norm           = _normalise_weights(weights)
         composite        = float(current_sig_vals @ w_norm)
 
-        # ── Bearish-transition probability via HMM posterior ──────────────
-        # predict_proba gives P(state=k | full observation sequence).
-        # Summing bearish-state posteriors at the last timestep tells us
-        # how likely the market is transitioning into a bearish regime,
-        # even before the Viterbi path officially flips to "bearish".
-        last_feat   = features.iloc[[-1]].values          # shape (1, 3)
-        X_last      = scaler.transform(last_feat)
-        proba_last  = model.predict_proba(X_last)[0]       # shape (n_components,)
-        bearish_ids = [s for s, lbl in regime_map.items() if lbl == "bearish"]
+        last_feat    = features.iloc[[-1]].values
+        X_last       = scaler.transform(last_feat)
+        proba_last   = model.predict_proba(X_last)[0]
+        bearish_ids  = [s for s, lbl in regime_map.items() if lbl == "bearish"]
         bearish_prob = float(sum(proba_last[s] for s in bearish_ids))
 
-        # ── Recommendation logic ───────────────────────────────────────────
-        # Rule: NEVER recommend SELL when the regime is bullish.
-        # SELL is only triggered when:
-        #   (a) the current regime is already bearish, OR
-        #   (b) the regime is neutral AND bearish posterior >= 0.40
-        #       (i.e. the HMM sees imminent transition into bearish territory)
+        # ── Recommendation ────────────────────────────────────────────────
         if current_regime == "bullish":
             recommendation = "BUY" if composite > 0.10 else "NEUTRAL"
         elif current_regime == "bearish":
             recommendation = "SELL"
-        else:  # neutral
+        else:  # neutral — check transition probability
             recommendation = "SELL" if bearish_prob >= 0.40 else "NEUTRAL"
+
+        _upd(100, "Analysis complete.")
 
         return {
             "ticker":          ticker,
