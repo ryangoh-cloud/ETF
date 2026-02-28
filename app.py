@@ -1,0 +1,740 @@
+"""
+ETF Regime Trading Dashboard
+─────────────────────────────
+Streamlit app — dark terminal aesthetic, Plotly charts.
+Run: streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+from etf_engine import (
+    ETF_UNIVERSE,
+    REGIME_COLORS,
+    REGIME_PALETTE,
+    run_analysis,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="ETF Regime Trader | Citadel",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS  —  dark terminal theme
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+    /* ── Base ─────────────────────────────── */
+    html, body, [class*="css"] {
+        font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+    }
+    .stApp { background-color: #0d1117; color: #c9d1d9; }
+    section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
+    .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+
+    /* ── Cards ────────────────────────────── */
+    .card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        padding: 18px 20px;
+        height: 100%;
+    }
+    .card-label {
+        font-size: 10px;
+        color: #8b949e;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        margin-bottom: 6px;
+    }
+    .card-value {
+        font-size: 26px;
+        font-weight: 700;
+        letter-spacing: 1px;
+    }
+    .pos  { color: #3fb950; }
+    .neg  { color: #f85149; }
+    .neut { color: #d29922; }
+    .blue { color: #58a6ff; }
+
+    /* ── Recommendation ───────────────────── */
+    .rec-wrap {
+        background: #161b22;
+        border-radius: 12px;
+        padding: 22px;
+        text-align: center;
+        height: 100%;
+        border: 2px solid;
+    }
+    .rec-buy   { border-color: #3fb950; }
+    .rec-sell  { border-color: #f85149; }
+    .rec-neut  { border-color: #d29922; }
+    .rec-title { font-size: 10px; color: #8b949e; letter-spacing: 2px; }
+    .rec-badge {
+        font-size: 36px;
+        font-weight: 900;
+        letter-spacing: 5px;
+        margin: 10px 0 6px;
+    }
+    .rec-score { font-size: 11px; color: #8b949e; margin-top: 4px; }
+
+    /* ── Regime badge ─────────────────────── */
+    .rbadge {
+        display: inline-block;
+        padding: 4px 14px;
+        border-radius: 20px;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+    }
+    .rbadge-bullish { background:rgba(63,185,80,.18);  color:#3fb950; border:1px solid #3fb950; }
+    .rbadge-neutral { background:rgba(210,153,34,.18); color:#d29922; border:1px solid #d29922; }
+    .rbadge-bearish { background:rgba(248,81,73,.18);  color:#f85149; border:1px solid #f85149; }
+
+    /* ── Metric grid ──────────────────────── */
+    .metric-grid { display:flex; gap:12px; margin-bottom:12px; }
+    hr.dim { border:none; border-top:1px solid #21262d; margin:14px 0; }
+
+    /* ── Trade blotter ────────────────────── */
+    .blotter-header {
+        font-size: 10px;
+        color: #8b949e;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        margin-bottom: 10px;
+    }
+
+    /* ── Plotly overrides ─────────────────── */
+    .js-plotly-plot .plotly .modebar { background: transparent !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(
+        '<p style="font-size:20px;font-weight:700;color:#e6edf3;letter-spacing:2px;">'
+        '📈 REGIME TRADER</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<hr class="dim">', unsafe_allow_html=True)
+
+    ticker = st.selectbox(
+        "ETF",
+        ETF_UNIVERSE,
+        index=0,
+        label_visibility="collapsed",
+        key="ticker_select",
+    )
+    st.caption(f"Universe: {' · '.join(ETF_UNIVERSE)}")
+
+    st.markdown('<hr class="dim">', unsafe_allow_html=True)
+    st.markdown(
+        """
+        **Strategy logic**
+        - Regime: GaussianHMM · 5 states
+        - Signals: RSI · Momentum · Vol · ADX · EMA
+        - Entry: bullish regime ∧ score > 0.10
+        - Exit: bearish regime (or neutral + bearish prob ≥ 40%)
+        - Lookback: 2 years
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown('<hr class="dim">', unsafe_allow_html=True)
+    refresh = st.button("⟳  Refresh Analysis", use_container_width=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cached analysis
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-ticker version counter — incrementing only invalidates the current ETF's
+# cache entry, leaving all other ETFs' results intact.
+if "ticker_versions" not in st.session_state:
+    st.session_state.ticker_versions = {t: 0 for t in ETF_UNIVERSE}
+
+if refresh:
+    st.session_state.ticker_versions[ticker] = (
+        st.session_state.ticker_versions.get(ticker, 0) + 1
+    )
+
+
+@st.cache_data(ttl=3_600, show_spinner=False, max_entries=len(ETF_UNIVERSE) * 3)
+def cached_analysis(sym: str, cache_v: int) -> dict | None:
+    return run_analysis(sym)
+
+
+_cache_v = st.session_state.ticker_versions.get(ticker, 0)
+with st.spinner(f"Analysing {ticker} — first run may take ~20 s …"):
+    result = cached_analysis(ticker, _cache_v)
+
+if result is None:
+    st.error(
+        f"**{ticker}** — insufficient data or download error.  "
+        "The ETF may be too new or temporarily unavailable."
+    )
+    st.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unpack
+# ─────────────────────────────────────────────────────────────────────────────
+df            = result["df"]
+df_lb         = result["df_lb"]
+regimes       = result["regimes"]
+regimes_lb    = result["regimes_lb"]
+signals       = result["signals"]
+signals_lb    = result["signals_lb"]
+weights       = result["weights"]
+w_norm        = result["w_norm"]
+strat_returns = result["strat_returns"]
+position      = result["position"]
+metrics       = result["metrics"]
+trades        = result["trades"]
+recommendation   = result["recommendation"]
+current_regime   = result["current_regime"]
+composite        = result["composite"]
+bearish_prob     = result["bearish_prob"]
+signal_names     = result["signal_names"]
+current_signals  = result["current_signals"]
+
+current_price = float(df["close"].iloc[-1])
+prev_price    = float(df["close"].iloc[-2])
+price_chg     = (current_price - prev_price) / (prev_price + 1e-10)
+price_color   = "#3fb950" if price_chg >= 0 else "#f85149"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── HEADER ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown(
+    f"""
+    <div style="display:flex;align-items:baseline;gap:18px;margin-bottom:4px;">
+        <span style="font-size:22px;font-weight:800;color:#e6edf3;letter-spacing:2px;">
+            ETF REGIME TRADING DASHBOARD
+        </span>
+        <span style="font-size:18px;color:#58a6ff;font-weight:700;">{ticker}</span>
+        <span style="font-size:20px;color:#e6edf3;font-weight:600;">
+            ${current_price:,.2f}
+        </span>
+        <span style="font-size:16px;color:{price_color};font-weight:600;">
+            {price_chg:+.2%}
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.markdown('<hr class="dim">', unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ROW 1: Recommendation | Regime | Signals ──────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+col_rec, col_reg, col_sig = st.columns([1.1, 1.1, 2.2], gap="medium")
+
+# ── Recommendation ────────────────────────────────────────────────────────────
+rec_css = {"BUY": "rec-buy", "SELL": "rec-sell", "NEUTRAL": "rec-neut"}[recommendation]
+rec_col = {"BUY": "#3fb950", "SELL": "#f85149", "NEUTRAL": "#d29922"}[recommendation]
+rec_ico = {"BUY": "▲", "SELL": "▼", "NEUTRAL": "◆"}[recommendation]
+
+# Short rationale shown beneath the recommendation badge
+if recommendation == "BUY":
+    rec_rationale = "Bullish regime · signals aligned"
+elif recommendation == "SELL" and current_regime == "bearish":
+    rec_rationale = "Bearish regime confirmed · exit"
+elif recommendation == "SELL":
+    rec_rationale = f"Regime transitioning · {bearish_prob:.0%} bearish prob"
+else:
+    rec_rationale = "Await clearer regime signal"
+
+with col_rec:
+    st.markdown(
+        f"""
+        <div class="rec-wrap {rec_css}">
+            <div class="rec-title">RECOMMENDATION</div>
+            <div class="rec-badge" style="color:{rec_col};">{rec_ico} {recommendation}</div>
+            <div class="rec-score">
+                Composite score&nbsp;
+                <span style="color:#e6edf3;font-size:13px;">{composite:+.3f}</span>
+            </div>
+            <div style="font-size:10px;color:{rec_col};margin-top:6px;letter-spacing:0.5px;">
+                {rec_rationale}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ── Regime ────────────────────────────────────────────────────────────────────
+bull_pct = (regimes_lb == "bullish").mean() * 100
+bear_pct = (regimes_lb == "bearish").mean() * 100
+neut_pct = (regimes_lb == "neutral").mean() * 100
+
+# Bearish-transition probability bar — only meaningful in neutral/bearish regimes
+bp_pct       = bearish_prob * 100
+bp_color     = "#f85149" if bearish_prob >= 0.40 else ("#d29922" if bearish_prob >= 0.20 else "#8b949e")
+bp_label     = "HIGH — exit risk elevated" if bearish_prob >= 0.40 else (
+               "MODERATE" if bearish_prob >= 0.20 else "LOW")
+show_bp_bar  = current_regime in ("neutral", "bearish")
+bp_html      = (
+    f"""
+    <hr class="dim">
+    <div class="card-label">BEARISH TRANSITION PROBABILITY</div>
+    <div style="margin-top:6px;">
+        <div style="background:#21262d;border-radius:4px;height:7px;overflow:hidden;">
+            <div style="width:{min(bp_pct,100):.0f}%;height:100%;background:{bp_color};
+                        border-radius:4px;transition:width .4s;"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:4px;">
+            <span style="font-size:11px;color:{bp_color};">{bp_label}</span>
+            <span style="font-size:11px;color:#e6edf3;font-family:monospace;">{bp_pct:.0f}%</span>
+        </div>
+    </div>
+    """
+    if show_bp_bar else ""
+)
+
+with col_reg:
+    st.markdown(
+        f"""
+        <div class="card">
+            <div class="card-label">CURRENT MARKET REGIME</div>
+            <div style="margin:10px 0 12px;">
+                <span class="rbadge rbadge-{current_regime}">
+                    {current_regime.upper()}
+                </span>
+            </div>
+            <hr class="dim">
+            <div class="card-label">2-Year Regime Distribution</div>
+            <div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;">
+                <span style="color:#3fb950;font-size:12px;">▲ Bull {bull_pct:.0f}%</span>
+                <span style="color:#d29922;font-size:12px;">◆ Neut {neut_pct:.0f}%</span>
+                <span style="color:#f85149;font-size:12px;">▼ Bear {bear_pct:.0f}%</span>
+            </div>
+            {bp_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ── Signal bar chart ──────────────────────────────────────────────────────────
+with col_sig:
+    sig_vals   = list(current_signals.values())
+    sig_labels = [n.upper() for n in signal_names]
+    bar_colors = ["#3fb950" if v >= 0 else "#f85149" for v in sig_vals]
+    weight_pcts = [f"{w:.0%}" for w in w_norm]
+
+    fig_sig = go.Figure(
+        go.Bar(
+            x=sig_labels,
+            y=sig_vals,
+            marker_color=bar_colors,
+            text=[f"{v:+.2f}" for v in sig_vals],
+            textposition="outside",
+            textfont=dict(size=10, color="#c9d1d9"),
+            customdata=weight_pcts,
+            hovertemplate="<b>%{x}</b><br>Value: %{y:.3f}<br>Weight: %{customdata}<extra></extra>",
+        )
+    )
+    fig_sig.add_hline(y=0, line_color="#30363d", line_width=1)
+    fig_sig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=148,
+        margin=dict(l=4, r=4, t=22, b=4),
+        title=dict(
+            text="SIGNAL SCORES  (weights: " + "  ".join(
+                f"{n.upper()} {w:.0%}" for n, w in zip(signal_names, w_norm)
+            ) + ")",
+            font=dict(size=9, color="#8b949e"),
+            x=0,
+        ),
+        xaxis=dict(showgrid=False, tickfont=dict(size=11)),
+        yaxis=dict(showgrid=False, range=[-1.3, 1.3], zeroline=False),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_sig, use_container_width=True, config={"displayModeBar": False})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ROW 2: Performance metrics ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<hr class="dim">', unsafe_allow_html=True)
+st.markdown(
+    '<div class="card-label" style="font-size:11px;margin-bottom:10px;">'
+    'PERFORMANCE METRICS — 2-YEAR BACKTEST</div>',
+    unsafe_allow_html=True,
+)
+
+m1, m2, m3, m4 = st.columns(4, gap="medium")
+
+tr  = metrics["total_return"]
+sr  = metrics["sharpe"]
+wr  = metrics["win_rate"]
+mdd = metrics["max_drawdown"]
+
+def _metric_card(label: str, value_str: str, css_class: str) -> str:
+    return (
+        f'<div class="card" style="text-align:center;">'
+        f'<div class="card-label">{label}</div>'
+        f'<div class="card-value {css_class}">{value_str}</div>'
+        f'</div>'
+    )
+
+with m1:
+    st.markdown(
+        _metric_card("Total Return", f"{tr:+.1%}", "pos" if tr >= 0 else "neg"),
+        unsafe_allow_html=True,
+    )
+with m2:
+    sr_cls = "pos" if sr > 1 else ("neg" if sr < 0 else "neut")
+    st.markdown(_metric_card("Sharpe Ratio", f"{sr:.2f}", sr_cls), unsafe_allow_html=True)
+with m3:
+    wr_cls = "pos" if wr >= 0.5 else ("neg" if wr < 0.4 else "neut")
+    st.markdown(_metric_card("Win Rate", f"{wr:.1%}", wr_cls), unsafe_allow_html=True)
+with m4:
+    st.markdown(_metric_card("Max Drawdown", f"{mdd:.1%}", "neg"), unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ROW 3: Candlestick chart with regime shading ──────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<hr class="dim">', unsafe_allow_html=True)
+st.markdown(
+    '<div class="card-label" style="font-size:11px;margin-bottom:8px;">'
+    'PRICE ACTION — REGIME BACKGROUND · ENTRY / EXIT MARKERS</div>',
+    unsafe_allow_html=True,
+)
+
+
+def _regime_shading(fig: go.Figure, regimes_s: pd.Series) -> None:
+    """Paint vertical bands by regime."""
+    if regimes_s.empty:
+        return
+    rdf = pd.DataFrame({"regime": regimes_s})
+    rdf["grp"] = (rdf["regime"] != rdf["regime"].shift()).cumsum()
+    for _, grp in rdf.groupby("grp", sort=False):
+        regime = grp["regime"].iloc[0]
+        fig.add_vrect(
+            x0=grp.index[0],
+            x1=grp.index[-1],
+            fillcolor=REGIME_COLORS.get(regime, "rgba(0,0,0,0)"),
+            opacity=1,
+            layer="below",
+            line_width=0,
+        )
+
+
+def build_price_chart(
+    df_1y: pd.DataFrame,
+    regimes_1y: pd.Series,
+    position: pd.Series,
+) -> go.Figure:
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        row_heights=[0.72, 0.28],
+    )
+
+    # ── Candlestick ──────────────────────────────────────────────────────────
+    fig.add_trace(
+        go.Candlestick(
+            x=df_1y.index,
+            open=df_1y["open"], high=df_1y["high"],
+            low=df_1y["low"],   close=df_1y["close"],
+            name="OHLC",
+            increasing=dict(line=dict(color="#3fb950", width=1), fillcolor="#3fb950"),
+            decreasing=dict(line=dict(color="#f85149", width=1), fillcolor="#f85149"),
+            whiskerwidth=0.3,
+        ),
+        row=1, col=1,
+    )
+
+    # ── EMA overlays ─────────────────────────────────────────────────────────
+    ema_params = [(12, "#58a6ff", "solid", 1.2), (26, "#d29922", "solid", 1.2), (50, "#bc8cff", "dot", 1.0)]
+    for span, col, dash, width in ema_params:
+        fig.add_trace(
+            go.Scatter(
+                x=df_1y.index,
+                y=df_1y["close"].ewm(span=span, adjust=False).mean(),
+                name=f"EMA {span}",
+                line=dict(color=col, width=width, dash=dash),
+                opacity=0.85,
+                hoverinfo="skip",
+            ),
+            row=1, col=1,
+        )
+
+    # ── Entry / exit markers ─────────────────────────────────────────────────
+    pos_r = position.reindex(df_1y.index).fillna(0.0)
+    prev  = pos_r.shift(1, fill_value=0.0)
+    entries = pos_r.index[(pos_r == 1.0) & (prev == 0.0)]
+    exits   = pos_r.index[(pos_r == 0.0) & (prev == 1.0)]
+
+    if len(entries):
+        fig.add_trace(
+            go.Scatter(
+                x=entries,
+                y=df_1y.loc[entries, "low"] * 0.988,
+                mode="markers",
+                name="Entry ▲",
+                marker=dict(symbol="triangle-up", size=11, color="#3fb950",
+                            line=dict(color="#e6edf3", width=0.5)),
+                hovertemplate="Entry: %{x|%Y-%m-%d}<extra></extra>",
+            ),
+            row=1, col=1,
+        )
+
+    if len(exits):
+        fig.add_trace(
+            go.Scatter(
+                x=exits,
+                y=df_1y.loc[exits, "high"] * 1.012,
+                mode="markers",
+                name="Exit ▼",
+                marker=dict(symbol="triangle-down", size=11, color="#f85149",
+                            line=dict(color="#e6edf3", width=0.5)),
+                hovertemplate="Exit: %{x|%Y-%m-%d}<extra></extra>",
+            ),
+            row=1, col=1,
+        )
+
+    # ── Volume bars ───────────────────────────────────────────────────────────
+    vol_colors = [
+        "#3fb950" if c >= o else "#f85149"
+        for c, o in zip(df_1y["close"], df_1y["open"])
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=df_1y.index,
+            y=df_1y["volume"],
+            name="Volume",
+            marker_color=vol_colors,
+            marker_opacity=0.55,
+            showlegend=False,
+            hovertemplate="Vol: %{y:,.0f}<extra></extra>",
+        ),
+        row=2, col=1,
+    )
+
+    # ── Regime shading ────────────────────────────────────────────────────────
+    _regime_shading(fig, regimes_1y)
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0d1117",
+        plot_bgcolor="#0d1117",
+        height=560,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(
+            orientation="h", y=1.01, x=0,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=10),
+        ),
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        xaxis2=dict(showgrid=True,  gridcolor="#1c2128"),
+        yaxis =dict(showgrid=True,  gridcolor="#1c2128", side="right", tickprefix="$"),
+        yaxis2=dict(showgrid=False, side="right", showticklabels=False),
+    )
+    # Shared x-axis minor gridlines
+    fig.update_xaxes(showgrid=True, gridcolor="#1c2128", zeroline=False)
+
+    return fig
+
+
+chart = build_price_chart(df_lb, regimes_lb, position)
+st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": True, "displaylogo": False})
+
+# ── Regime legend key ─────────────────────────────────────────────────────────
+st.markdown(
+    """
+    <div style="display:flex;gap:20px;margin-top:-8px;margin-bottom:4px;font-size:11px;color:#8b949e;">
+        <span><span style="display:inline-block;width:12px;height:12px;background:rgba(0,200,100,0.30);
+              border-radius:2px;margin-right:4px;"></span>Bullish regime</span>
+        <span><span style="display:inline-block;width:12px;height:12px;background:rgba(255,80,80,0.30);
+              border-radius:2px;margin-right:4px;"></span>Bearish regime</span>
+        <span><span style="display:inline-block;width:12px;height:12px;background:rgba(210,153,34,0.20);
+              border-radius:2px;margin-right:4px;"></span>Neutral regime</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ROW 4: Cumulative returns vs Buy & Hold ────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<hr class="dim">', unsafe_allow_html=True)
+st.markdown(
+    '<div class="card-label" style="font-size:11px;margin-bottom:8px;">'
+    'CUMULATIVE RETURNS — STRATEGY vs BUY &amp; HOLD</div>',
+    unsafe_allow_html=True,
+)
+
+if len(strat_returns) > 1:
+    cum_strat = (1 + strat_returns).cumprod()
+    bh_ret    = df_lb["close"].pct_change().dropna().reindex(strat_returns.index)
+    cum_bh    = (1 + bh_ret.fillna(0)).cumprod()
+
+    final_strat = cum_strat.iloc[-1]
+    final_bh    = cum_bh.iloc[-1]
+
+    fig_cum = go.Figure()
+    fig_cum.add_trace(
+        go.Scatter(
+            x=cum_strat.index, y=cum_strat,
+            name=f"Strategy ({final_strat - 1:+.1%})",
+            line=dict(color="#58a6ff", width=2.2),
+            fill="tozeroy",
+            fillcolor="rgba(88,166,255,0.07)",
+            hovertemplate="%{x|%Y-%m-%d}  %{y:.3f}<extra>Strategy</extra>",
+        )
+    )
+    fig_cum.add_trace(
+        go.Scatter(
+            x=cum_bh.index, y=cum_bh,
+            name=f"Buy & Hold ({final_bh - 1:+.1%})",
+            line=dict(color="#8b949e", width=1.5, dash="dash"),
+            hovertemplate="%{x|%Y-%m-%d}  %{y:.3f}<extra>Buy & Hold</extra>",
+        )
+    )
+    fig_cum.add_hline(y=1.0, line_color="#30363d", line_dash="dot", line_width=1)
+
+    fig_cum.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0d1117",
+        plot_bgcolor="#0d1117",
+        height=230,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", y=1.05, bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+        xaxis=dict(showgrid=True, gridcolor="#1c2128"),
+        yaxis=dict(showgrid=True, gridcolor="#1c2128", side="right", tickformat=".2f"),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_cum, use_container_width=True, config={"displayModeBar": False})
+else:
+    st.info("Insufficient trades to plot cumulative returns.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ROW 5: Trade Blotter ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<hr class="dim">', unsafe_allow_html=True)
+st.markdown(
+    '<div class="card-label" style="font-size:11px;margin-bottom:12px;">'
+    'TRADE BLOTTER — 2-YEAR LOOKBACK</div>',
+    unsafe_allow_html=True,
+)
+
+if trades.empty:
+    st.info(
+        "No trades were executed in the 2-year lookback window.  "
+        "Bullish regime + positive composite signal was never triggered simultaneously."
+    )
+else:
+    # ── Summary mini-metrics ──────────────────────────────────────────────────
+    n_total = len(trades)
+    n_win   = int((trades["Result"] == "Win").sum())
+    n_loss  = int((trades["Result"] == "Loss").sum())
+    n_open  = int((trades["Result"] == "Open").sum())
+    avg_ret = trades["Return (%)"].mean()
+
+    bc1, bc2, bc3, bc4, bc5 = st.columns(5, gap="medium")
+    with bc1:
+        st.markdown(
+            _metric_card("Total Trades", str(n_total), "blue"),
+            unsafe_allow_html=True,
+        )
+    with bc2:
+        st.markdown(_metric_card("Wins", str(n_win), "pos"), unsafe_allow_html=True)
+    with bc3:
+        st.markdown(_metric_card("Losses", str(n_loss), "neg"), unsafe_allow_html=True)
+    with bc4:
+        st.markdown(_metric_card("Open", str(n_open), "blue"), unsafe_allow_html=True)
+    with bc5:
+        st.markdown(
+            _metric_card("Avg Return", f"{avg_ret:+.2f}%", "pos" if avg_ret >= 0 else "neg"),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Styled table ──────────────────────────────────────────────────────────
+    display_df = (
+        trades
+        .sort_values("Entry Date", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    def _color_result(val: str) -> str:
+        return {
+            "Win":  "color: #3fb950; font-weight:600;",
+            "Loss": "color: #f85149; font-weight:600;",
+            "Open": "color: #58a6ff; font-weight:600;",
+        }.get(val, "")
+
+    def _color_return(val: float) -> str:
+        if isinstance(val, (int, float)):
+            return "color: #3fb950;" if val > 0 else "color: #f85149;"
+        return ""
+
+    styled = (
+        display_df.style
+        .map(_color_result, subset=["Result"])
+        .map(_color_return, subset=["Return (%)"])
+        .set_properties(**{
+            "background-color": "#161b22",
+            "border":           "1px solid #21262d",
+            "font-size":        "12px",
+        })
+        .set_table_styles([
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", "#21262d"),
+                    ("color", "#8b949e"),
+                    ("font-size", "10px"),
+                    ("text-transform", "uppercase"),
+                    ("letter-spacing", "1px"),
+                ],
+            },
+            {
+                "selector": "tr:hover td",
+                "props": [("background-color", "#1c2128")],
+            },
+        ])
+        .format({"Return (%)": "{:+.2f}%", "Entry Price": "${:.2f}", "Exit Price": "${:.2f}"})
+    )
+
+    st.dataframe(styled, use_container_width=True, height=min(420, 60 + 36 * len(display_df)))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Footer ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<hr class="dim">', unsafe_allow_html=True)
+st.markdown(
+    '<div style="font-size:10px;color:#484f58;text-align:center;">'
+    'For educational purposes only. Not investment advice. '
+    'Data via yfinance · Regime via hmmlearn GaussianHMM · Signals optimised via SciPy'
+    '</div>',
+    unsafe_allow_html=True,
+)
