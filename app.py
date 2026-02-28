@@ -25,7 +25,7 @@ from etf_engine import (
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="ETF Regime Trader | Citadel",
+    page_title="ETF Regime Trader",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -833,8 +833,9 @@ else:
 st.markdown('<hr class="dim">', unsafe_allow_html=True)
 st.markdown(
     '<div style="font-size:10px;color:#484f58;text-align:center;">'
-    'For educational purposes only. Not investment advice. '
-    'Data via yfinance · Regime via hmmlearn GaussianHMM · Signals optimised via SciPy'
+    'This is for educational purposes and should not be treated as investment advice. '
+    'Data provided via yfinance · Training conducted via hmmlearn GaussianHMM · Signals optimised via SciPy'
+    'Email the author at ryangoh@outlook.com for feedback.'
     '</div>',
     unsafe_allow_html=True,
 )
