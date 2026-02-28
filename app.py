@@ -34,14 +34,15 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS  —  dark terminal theme
 # ─────────────────────────────────────────────────────────────────────────────
+
 st.markdown("""
     <style>
-        [data-testid="stHeader"] {
-            visibility: hidden;
-            height: 0%;
-        }
+    .block-container {
+        padding-top: 2rem; /* Increase this value if needed (e.g., 3rem) */
+    }
     </style>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+
 
 st.markdown(
     """
