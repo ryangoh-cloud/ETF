@@ -34,7 +34,6 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS  —  dark terminal theme
 # ─────────────────────────────────────────────────────────────────────────────
-
 st.markdown("""
     <style>
         [data-testid="stHeader"] {
@@ -141,14 +140,14 @@ st.markdown(
 with st.sidebar:
     st.markdown(
         '<p style="font-size:20px;font-weight:700;color:#e6edf3;letter-spacing:2px;">'
-        '📈 Dashboard Controls </p>',
+        '📈 DASHBOARD CONTROLS </p>',
         unsafe_allow_html=True,
     )
     st.markdown('<hr class="dim">', unsafe_allow_html=True)
 
     # ── Preset universe ───────────────────────────────────────────────────────
     st.markdown(
-        '<div class="card-label" style="margin-bottom:4px;">PRESET ETF </div>',
+        '<div class="card-label" style="margin-bottom:4px;">PRESET UNIVERSE</div>',
         unsafe_allow_html=True,
     )
     preset_ticker = st.selectbox(
@@ -336,7 +335,7 @@ st.markdown(
     f"""
     <div style="display:flex;align-items:baseline;gap:18px;margin-bottom:4px;">
         <span style="font-size:22px;font-weight:800;color:#e6edf3;letter-spacing:2px;">
-            ETF TRADING DASHBOARD
+            ETF REGIME TRADING DASHBOARD
         </span>
         <span style="font-size:18px;color:#58a6ff;font-weight:700;">{ticker}</span>
         <span style="font-size:20px;color:#e6edf3;font-weight:600;">
@@ -758,7 +757,7 @@ st.markdown(
 if trades.empty:
     st.info(
         "No trades were executed in the 2-year lookback window.  "
-        "Bullish regimes + positive composite signal was never triggered simultaneously."
+        "Bullish regime + positive composite signal was never triggered simultaneously."
     )
 else:
     # ── Summary mini-metrics ──────────────────────────────────────────────────
