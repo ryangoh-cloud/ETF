@@ -25,7 +25,7 @@ from etf_engine import (
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="ETF Regime Trader",
+    page_title="ETF Dashboard",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -34,6 +34,16 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS  —  dark terminal theme
 # ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown("""
+    <style>
+        [data-testid="stHeader"] {
+            visibility: hidden;
+            height: 0%;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
 st.markdown(
     """
     <style>
@@ -131,14 +141,14 @@ st.markdown(
 with st.sidebar:
     st.markdown(
         '<p style="font-size:20px;font-weight:700;color:#e6edf3;letter-spacing:2px;">'
-        '📈 REGIME TRADER</p>',
+        '📈 Dashboard Controls </p>',
         unsafe_allow_html=True,
     )
     st.markdown('<hr class="dim">', unsafe_allow_html=True)
 
     # ── Preset universe ───────────────────────────────────────────────────────
     st.markdown(
-        '<div class="card-label" style="margin-bottom:4px;">PRESET UNIVERSE</div>',
+        '<div class="card-label" style="margin-bottom:4px;">PRESET ETF </div>',
         unsafe_allow_html=True,
     )
     preset_ticker = st.selectbox(
@@ -326,7 +336,7 @@ st.markdown(
     f"""
     <div style="display:flex;align-items:baseline;gap:18px;margin-bottom:4px;">
         <span style="font-size:22px;font-weight:800;color:#e6edf3;letter-spacing:2px;">
-            ETF REGIME TRADING DASHBOARD
+            ETF TRADING DASHBOARD
         </span>
         <span style="font-size:18px;color:#58a6ff;font-weight:700;">{ticker}</span>
         <span style="font-size:20px;color:#e6edf3;font-weight:600;">
@@ -748,7 +758,7 @@ st.markdown(
 if trades.empty:
     st.info(
         "No trades were executed in the 2-year lookback window.  "
-        "Bullish regime + positive composite signal was never triggered simultaneously."
+        "Bullish regimes + positive composite signal was never triggered simultaneously."
     )
 else:
     # ── Summary mini-metrics ──────────────────────────────────────────────────
@@ -833,9 +843,9 @@ else:
 st.markdown('<hr class="dim">', unsafe_allow_html=True)
 st.markdown(
     '<div style="font-size:10px;color:#484f58;text-align:center;">'
-    'This is for educational purposes and should not be treated as investment advice. '
-    'Data provided via yfinance · Training conducted via hmmlearn GaussianHMM · Signals optimised via SciPy'
-    'Email the author at ryangoh@outlook.com for feedback.'
+    '<br> This is for educational purposes and should not be treated as investment advice. </br>'
+    '<br> Data provided via yfinance · Training conducted via hmmlearn GaussianHMM · Signals optimised via SciPy </br>'
+    '<br> Email the author at ryangoh@outlook.com for feedback </br>'
     '</div>',
     unsafe_allow_html=True,
 )
