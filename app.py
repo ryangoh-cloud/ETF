@@ -38,7 +38,7 @@ st.set_page_config(
 # CSS  —  dark terminal theme
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Hide the default Streamlit toolbar so the custom header is fully visible
+
 st.markdown("""
     <style>
     .block-container {
@@ -334,6 +334,14 @@ if result is None:
     # session element-ID collision.
     _progress_slot = st.empty()
     with _progress_slot.container():
+        st.markdown("""
+            <style>
+            .block-container {
+                padding-top: 3rem;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+        
         st.markdown(
             f'<div class="card-label" style="margin-bottom:6px;">'
             f'RUNNING ANALYSIS — {ticker}</div>',
