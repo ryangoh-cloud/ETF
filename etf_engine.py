@@ -160,7 +160,7 @@ def fit_hmm(
 # Technical Signals  (each normalised to roughly [-1, +1], +1 = bullish)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _zscore(series: pd.Series, window: int = 126, min_p: int = 30) -> pd.Series:
+def _zscore(series: pd.Series, window: int = 60, min_p: int = 15) -> pd.Series:
     mu  = series.rolling(window, min_periods=min_p).mean()
     sig = series.rolling(window, min_periods=min_p).std()
     return ((series - mu) / (sig + 1e-10)).clip(-3, 3) / 3
@@ -169,12 +169,13 @@ def _zscore(series: pd.Series, window: int = 126, min_p: int = 30) -> pd.Series:
 # ── Original five signals ─────────────────────────────────────────────────────
 
 def signal_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
-    """RSI normalised: oversold → +1 (buy), overbought → -1 (sell)."""
+    """RSI normalised: oversold → +1 (buy), overbought → -1 (sell).
+    Remapped so RSI=30 → +1.0, RSI=50 → 0, RSI=70 → -1.0 (was ±0.4)."""
     delta = prices.diff()
     gain  = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
     loss  = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
     rsi   = 100 - 100 / (1 + gain / (loss + 1e-10))
-    return ((50 - rsi) / 50).clip(-1, 1)
+    return ((50 - rsi) / 20).clip(-1, 1)
 
 
 def signal_momentum(prices: pd.Series, period: int = 20) -> pd.Series:
@@ -216,7 +217,7 @@ def signal_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     adx = dx.ewm(alpha=alpha, adjust=False).mean()
 
     direction = np.sign(plus_di - minus_di)
-    return (direction * (adx / 100).clip(0, 1)).rename("adx")
+    return (direction * (adx / 50).clip(0, 1)).rename("adx")
 
 
 def signal_ema(prices: pd.Series, fast: int = 12, slow: int = 26, sig_p: int = 9) -> pd.Series:
@@ -239,7 +240,8 @@ def signal_stochastic(df: pd.DataFrame, period: int = 14, smooth: int = 3) -> pd
     high_n  = df["high"].rolling(period, min_periods=period  // 2).max()
     stoch_k = (df["close"] - low_n) / (high_n - low_n + 1e-10) * 100
     stoch_d = stoch_k.rolling(smooth, min_periods=1).mean()    # smooth (%D line)
-    return ((stoch_d - 50) / 50).clip(-1, 1).rename("stochastic")
+    # Remapped so stoch=20 → -1.0, stoch=50 → 0, stoch=80 → +1.0 (was ±0.6)
+    return ((stoch_d - 50) / 30).clip(-1, 1).rename("stochastic")
 
 
 def signal_bollinger(prices: pd.Series, period: int = 20, n_std: float = 2.0) -> pd.Series:
@@ -269,7 +271,8 @@ def signal_cmf(df: pd.DataFrame, period: int = 20) -> pd.Series:
     mf_vol   = mf_mult * df["volume"]
     vol_sum  = df["volume"].rolling(period, min_periods=period // 2).sum()
     cmf      = mf_vol.rolling(period, min_periods=period // 2).sum() / (vol_sum + 1e-10)
-    return cmf.clip(-1, 1).rename("cmf")
+    # Scale up 3× since CMF typically reads ±0.05–0.15 in real markets
+    return (cmf * 3).clip(-1, 1).rename("cmf")
 
 
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -313,7 +316,7 @@ def backtest(
     regimes: pd.Series,
     signals: pd.DataFrame,
     weights: np.ndarray,
-    entry_threshold: float = 0.10,
+    entry_threshold: float = 0.03,
 ) -> tuple[pd.Series, pd.Series]:
     """
     Long-only regime strategy.
@@ -589,11 +592,11 @@ def run_analysis(
 
         # ── Recommendation ────────────────────────────────────────────────
         if current_regime == "bullish":
-            recommendation = "BUY" if composite > 0.10 else "NEUTRAL"
+            recommendation = "BUY" if composite > 0.03 else "NEUTRAL"
         elif current_regime == "bearish":
             recommendation = "SELL"
         else:
-            recommendation = "SELL" if bearish_prob >= 0.40 else "NEUTRAL"
+            recommendation = "SELL" if bearish_prob >= 0.30 else "NEUTRAL"
 
         _upd(100, "Analysis complete.")
 

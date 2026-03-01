@@ -195,8 +195,8 @@ with st.sidebar:
         **Strategy logic**
         - Regime: GaussianHMM · 5 states
         - Signals: RSI · Momentum · Vol · ADX · EMA · Stoch · Bollinger · CMF
-        - Entry: bullish regime ∧ score > 0.10
-        - Exit: bearish regime (or neutral + bearish prob ≥ 40%)
+        - Entry: bullish regime ∧ score > 0.03
+        - Exit: bearish regime (or neutral + bearish prob ≥ 30%)
         - Lookback: 2 years
         """,
         unsafe_allow_html=True,
@@ -471,9 +471,9 @@ bear_pct = (regimes_lb == "bearish").mean() * 100
 neut_pct = (regimes_lb == "neutral").mean() * 100
 
 bp_pct      = bearish_prob * 100
-bp_color    = "#f85149" if bearish_prob >= 0.40 else ("#d29922" if bearish_prob >= 0.20 else "#8b949e")
-bp_label    = "HIGH — exit risk elevated" if bearish_prob >= 0.40 else (
-              "MODERATE" if bearish_prob >= 0.20 else "LOW")
+bp_color    = "#f85149" if bearish_prob >= 0.30 else ("#d29922" if bearish_prob >= 0.15 else "#8b949e")
+bp_label    = "HIGH — exit risk elevated" if bearish_prob >= 0.30 else (
+              "MODERATE" if bearish_prob >= 0.15 else "LOW")
 show_bp_bar = current_regime in ("neutral", "bearish")
 bp_html     = (
     f"""
