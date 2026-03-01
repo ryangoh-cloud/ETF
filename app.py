@@ -7,6 +7,9 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -22,7 +25,7 @@ from etf_engine import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page config
+# Page configuration
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ETF Dashboard",
@@ -35,14 +38,14 @@ st.set_page_config(
 # CSS  —  dark terminal theme
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Hide the default Streamlit toolbar so the custom header is fully visible
 st.markdown("""
     <style>
-        [data-testid="stHeader"] {
-            visibility: hidden;
-            height: 0%;
-        }
+    .block-container {
+        padding-top: 3rem;
+    }
     </style>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 st.markdown(
     """
@@ -141,14 +144,14 @@ st.markdown(
 with st.sidebar:
     st.markdown(
         '<p style="font-size:20px;font-weight:700;color:#e6edf3;letter-spacing:2px;">'
-        '📈 Dashboard Controls </p>',
+        '📈 Dashboard Controls</p>',
         unsafe_allow_html=True,
     )
     st.markdown('<hr class="dim">', unsafe_allow_html=True)
 
     # ── Preset universe ───────────────────────────────────────────────────────
     st.markdown(
-        '<div class="card-label" style="margin-bottom:4px;">PRESET ETF </div>',
+        '<div class="card-label" style="margin-bottom:4px;">PRESET ETF</div>',
         unsafe_allow_html=True,
     )
     preset_ticker = st.selectbox(
@@ -203,6 +206,7 @@ with st.sidebar:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ticker validation  (only for custom tickers — fast 5-day check)
+# @st.cache_data is safe here: validate_ticker makes no Streamlit element calls.
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3_600, show_spinner=False)
 def _cached_validate(sym: str) -> tuple[bool, str]:
@@ -222,44 +226,99 @@ if custom_clean and custom_clean not in ETF_UNIVERSE:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cached analysis
+# Process-global version counter  (shared refresh state across all sessions)
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-ticker version counter — incrementing only invalidates the current ETF's
-# cache entry, leaving all other ETFs' results intact.
-if "ticker_versions" not in st.session_state:
-    st.session_state.ticker_versions = {}
+@st.cache_resource
+def _get_version_state() -> dict:
+    """Initialised once per process; persists for the lifetime of the server."""
+    return {"versions": {}, "lock": threading.Lock()}
+
+_vstate = _get_version_state()
 
 if refresh:
-    st.session_state.ticker_versions[ticker] = (
-        st.session_state.ticker_versions.get(ticker, 0) + 1
-    )
+    with _vstate["lock"]:
+        _vstate["versions"][ticker] = _vstate["versions"].get(ticker, 0) + 1
 
-_cache_v = st.session_state.ticker_versions.get(ticker, 0)
-
-
-@st.cache_data(ttl=3_600, show_spinner=False, max_entries=30)
-def cached_analysis(sym: str, cache_v: int, _progress=None) -> dict | None:
-    """_progress is excluded from the cache key (leading underscore)."""
-    return run_analysis(sym, _progress=_progress)
+with _vstate["lock"]:
+    _cache_v = _vstate["versions"].get(ticker, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Progress bar  (shown only on first / refreshed computation, not on cache hits)
+# Manual analysis cache  (replaces @st.cache_data for the compute path)
+#
+# WHY NOT @st.cache_data here:
+#   @st.cache_data records every Streamlit element call made during the cached
+#   function — including those made via progress callbacks — as "messages" to
+#   replay on future cache hits. On a cache hit from a DIFFERENT session,
+#   Streamlit tries to replay those calls using element IDs from the original
+#   session, which no longer exist → KeyError → CacheReplayClosureError.
+#
+#   A plain dict in @st.cache_resource has NO replay mechanism, so progress
+#   callbacks referencing session-local UI elements (st.progress, st.empty)
+#   work safely across concurrent users.
 # ─────────────────────────────────────────────────────────────────────────────
-_done_key = f"_computed_{ticker}_{_cache_v}"
-_already_computed = st.session_state.get(_done_key, False)
+_CACHE_TTL  = 3_600   # seconds — matches old ttl=3600
+_CACHE_MAX  = 50      # max entries before LRU eviction
 
-_progress_slot = st.empty()   # single placeholder — cleared after computation
+@st.cache_resource
+def _get_analysis_store() -> dict:
+    """Process-global result store. Initialised once per server process."""
+    return {"results": {}, "lock": threading.Lock()}
 
-if not _already_computed:
-    # Build the staged progress UI inside the placeholder
+_astore = _get_analysis_store()
+
+
+def _cache_get(sym: str, cv: int) -> dict | None:
+    """Return cached result if present and not expired, else None."""
+    key = (sym, cv)
+    with _astore["lock"]:
+        entry = _astore["results"].get(key)
+        if entry is None:
+            return None
+        result, ts = entry
+        if time.time() - ts > _CACHE_TTL:
+            del _astore["results"][key]
+            return None
+        return result
+
+
+def _cache_put(sym: str, cv: int, result: dict | None) -> None:
+    """Store result; evict expired and oldest-over-limit entries."""
+    if result is None:
+        return
+    key = (sym, cv)
+    with _astore["lock"]:
+        now = time.time()
+        # Remove expired entries
+        stale = [k for k, (_, ts) in _astore["results"].items() if now - ts > _CACHE_TTL]
+        for k in stale:
+            del _astore["results"][k]
+        # Evict oldest if at capacity
+        while len(_astore["results"]) >= _CACHE_MAX:
+            oldest = min(_astore["results"], key=lambda k: _astore["results"][k][1])
+            del _astore["results"][oldest]
+        _astore["results"][key] = (result, now)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compute or serve from cache
+# ─────────────────────────────────────────────────────────────────────────────
+result = _cache_get(ticker, _cache_v)
+
+if result is None:
+    # Cache miss — show staged progress bar and run analysis directly.
+    # The progress callback captures session-local UI elements (_pbar,
+    # _status_txt). Because we call run_analysis() directly (NOT inside a
+    # @st.cache_data function), there is no replay mechanism and no cross-
+    # session element-ID collision.
+    _progress_slot = st.empty()
     with _progress_slot.container():
         st.markdown(
             f'<div class="card-label" style="margin-bottom:6px;">'
             f'RUNNING ANALYSIS — {ticker}</div>',
             unsafe_allow_html=True,
         )
-        _pbar = st.progress(0, text="Initialising…")
+        _pbar       = st.progress(0, text="Initialising…")
         _status_txt = st.empty()
 
     def _progress_callback(pct: int, msg: str) -> None:
@@ -277,16 +336,10 @@ if not _already_computed:
             unsafe_allow_html=True,
         )
 
-    result = cached_analysis(ticker, _cache_v, _progress_callback)
+    result = run_analysis(ticker, _progress=_progress_callback)
+    _progress_slot.empty()
+    _cache_put(ticker, _cache_v, result)
 
-    if result is not None:
-        st.session_state[_done_key] = True   # mark as computed for this session
-
-else:
-    # Cache hit — no progress bar needed, return immediately
-    result = cached_analysis(ticker, _cache_v)
-
-_progress_slot.empty()   # always clear — either after compute or instant
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Error handling
@@ -362,7 +415,6 @@ rec_css = {"BUY": "rec-buy", "SELL": "rec-sell", "NEUTRAL": "rec-neut"}[recommen
 rec_col = {"BUY": "#3fb950", "SELL": "#f85149", "NEUTRAL": "#d29922"}[recommendation]
 rec_ico = {"BUY": "▲", "SELL": "▼", "NEUTRAL": "◆"}[recommendation]
 
-# Short rationale shown beneath the recommendation badge
 if recommendation == "BUY":
     rec_rationale = "Bullish regime · signals aligned"
 elif recommendation == "SELL" and current_regime == "bearish":
@@ -395,13 +447,12 @@ bull_pct = (regimes_lb == "bullish").mean() * 100
 bear_pct = (regimes_lb == "bearish").mean() * 100
 neut_pct = (regimes_lb == "neutral").mean() * 100
 
-# Bearish-transition probability bar — only meaningful in neutral/bearish regimes
-bp_pct       = bearish_prob * 100
-bp_color     = "#f85149" if bearish_prob >= 0.40 else ("#d29922" if bearish_prob >= 0.20 else "#8b949e")
-bp_label     = "HIGH — exit risk elevated" if bearish_prob >= 0.40 else (
-               "MODERATE" if bearish_prob >= 0.20 else "LOW")
-show_bp_bar  = current_regime in ("neutral", "bearish")
-bp_html      = (
+bp_pct      = bearish_prob * 100
+bp_color    = "#f85149" if bearish_prob >= 0.40 else ("#d29922" if bearish_prob >= 0.20 else "#8b949e")
+bp_label    = "HIGH — exit risk elevated" if bearish_prob >= 0.40 else (
+              "MODERATE" if bearish_prob >= 0.20 else "LOW")
+show_bp_bar = current_regime in ("neutral", "bearish")
+bp_html     = (
     f"""
     <hr class="dim">
     <div class="card-label">BEARISH TRANSITION PROBABILITY</div>
@@ -444,9 +495,9 @@ with col_reg:
 
 # ── Signal bar chart ──────────────────────────────────────────────────────────
 with col_sig:
-    sig_vals   = list(current_signals.values())
-    sig_labels = [n.upper() for n in signal_names]
-    bar_colors = ["#3fb950" if v >= 0 else "#f85149" for v in sig_vals]
+    sig_vals    = list(current_signals.values())
+    sig_labels  = [n.upper() for n in signal_names]
+    bar_colors  = ["#3fb950" if v >= 0 else "#f85149" for v in sig_vals]
     weight_pcts = [f"{w:.0%}" for w in w_norm]
 
     fig_sig = go.Figure(
@@ -665,7 +716,6 @@ def build_price_chart(
         yaxis =dict(showgrid=True,  gridcolor="#1c2128", side="right", tickprefix="$"),
         yaxis2=dict(showgrid=False, side="right", showticklabels=False),
     )
-    # Shared x-axis minor gridlines
     fig.update_xaxes(showgrid=True, gridcolor="#1c2128", zeroline=False)
 
     return fig
@@ -758,7 +808,7 @@ st.markdown(
 if trades.empty:
     st.info(
         "No trades were executed in the 2-year lookback window.  "
-        "Bullish regimes + positive composite signal was never triggered simultaneously."
+        "Bullish regime + positive composite signal was never triggered simultaneously."
     )
 else:
     # ── Summary mini-metrics ──────────────────────────────────────────────────
@@ -770,10 +820,7 @@ else:
 
     bc1, bc2, bc3, bc4, bc5 = st.columns(5, gap="medium")
     with bc1:
-        st.markdown(
-            _metric_card("Total Trades", str(n_total), "blue"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(_metric_card("Total Trades", str(n_total), "blue"), unsafe_allow_html=True)
     with bc2:
         st.markdown(_metric_card("Wins", str(n_win), "pos"), unsafe_allow_html=True)
     with bc3:
@@ -837,15 +884,16 @@ else:
 
     st.dataframe(styled, use_container_width=True, height=min(420, 60 + 36 * len(display_df)))
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# ── Footer ─────────────────────────────────────────────────────────────────────
+# ── Footer ────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<hr class="dim">', unsafe_allow_html=True)
 st.markdown(
     '<div style="font-size:10px;color:#484f58;text-align:center;">'
-    '<br> This is for educational purposes and should not be treated as investment advice. </br>'
-    '<br> Data provided via yfinance · Training conducted via hmmlearn GaussianHMM · Signals optimised via SciPy </br>'
-    '<br> Email the author at ryangoh@outlook.com for feedback </br>'
+    '<br>This is for educational purposes and should not be treated as investment advice.</br>'
+    '<br>Data provided via yfinance · Training conducted via hmmlearn GaussianHMM · Signals optimised via SciPy</br>'
+    '<br>Email the author at ryangoh@outlook.com for feedback</br>'
     '</div>',
     unsafe_allow_html=True,
 )
