@@ -18,6 +18,7 @@ from plotly.subplots import make_subplots
 
 from etf_engine import (
     ETF_UNIVERSE,
+    OBJ_LABELS,
     REGIME_COLORS,
     REGIME_PALETTE,
     run_analysis,
@@ -193,13 +194,36 @@ with st.sidebar:
         """
         **Strategy logic**
         - Regime: GaussianHMM · 5 states
-        - Signals: RSI · Momentum · Vol · ADX · EMA
+        - Signals: RSI · Momentum · Vol · ADX · EMA · Stoch · Bollinger · CMF
         - Entry: bullish regime ∧ score > 0.10
         - Exit: bearish regime (or neutral + bearish prob ≥ 40%)
         - Lookback: 2 years
         """,
         unsafe_allow_html=True,
     )
+
+    # ── Optimisation objective ────────────────────────────────────────────────
+    st.markdown('<hr class="dim">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card-label" style="margin-bottom:4px;">OPTIMISATION OBJECTIVE</div>',
+        unsafe_allow_html=True,
+    )
+    _OBJ_OPTIONS  = list(OBJ_LABELS.keys())
+    _OBJ_DISPLAY  = {k: f"Max {v.title()}" for k, v in OBJ_LABELS.items()}
+    objective = st.selectbox(
+        "Optimisation objective",
+        options=_OBJ_OPTIONS,
+        format_func=lambda x: _OBJ_DISPLAY[x],
+        index=0,
+        label_visibility="collapsed",
+        key="objective_select",
+    )
+    st.markdown(
+        f'<div style="font-size:10px;color:#8b949e;margin-top:2px;">'
+        f'Weights are tuned to maximise {OBJ_LABELS[objective]}</div>',
+        unsafe_allow_html=True,
+    )
+
     st.markdown('<hr class="dim">', unsafe_allow_html=True)
     refresh = st.button("⟳  Refresh Analysis", use_container_width=True)
 
@@ -268,9 +292,9 @@ def _get_analysis_store() -> dict:
 _astore = _get_analysis_store()
 
 
-def _cache_get(sym: str, cv: int) -> dict | None:
+def _cache_get(sym: str, cv: int, obj: str) -> dict | None:
     """Return cached result if present and not expired, else None."""
-    key = (sym, cv)
+    key = (sym, cv, obj)
     with _astore["lock"]:
         entry = _astore["results"].get(key)
         if entry is None:
@@ -282,18 +306,16 @@ def _cache_get(sym: str, cv: int) -> dict | None:
         return result
 
 
-def _cache_put(sym: str, cv: int, result: dict | None) -> None:
+def _cache_put(sym: str, cv: int, obj: str, result: dict | None) -> None:
     """Store result; evict expired and oldest-over-limit entries."""
     if result is None:
         return
-    key = (sym, cv)
+    key = (sym, cv, obj)
     with _astore["lock"]:
         now = time.time()
-        # Remove expired entries
         stale = [k for k, (_, ts) in _astore["results"].items() if now - ts > _CACHE_TTL]
         for k in stale:
             del _astore["results"][k]
-        # Evict oldest if at capacity
         while len(_astore["results"]) >= _CACHE_MAX:
             oldest = min(_astore["results"], key=lambda k: _astore["results"][k][1])
             del _astore["results"][oldest]
@@ -303,7 +325,7 @@ def _cache_put(sym: str, cv: int, result: dict | None) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Compute or serve from cache
 # ─────────────────────────────────────────────────────────────────────────────
-result = _cache_get(ticker, _cache_v)
+result = _cache_get(ticker, _cache_v, objective)
 
 if result is None:
     # Cache miss — show staged progress bar and run analysis directly.
@@ -336,9 +358,9 @@ if result is None:
             unsafe_allow_html=True,
         )
 
-    result = run_analysis(ticker, _progress=_progress_callback)
+    result = run_analysis(ticker, _progress=_progress_callback, objective=objective)
     _progress_slot.empty()
-    _cache_put(ticker, _cache_v, result)
+    _cache_put(ticker, _cache_v, objective, result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,6 +397,7 @@ composite        = result["composite"]
 bearish_prob     = result["bearish_prob"]
 signal_names     = result["signal_names"]
 current_signals  = result["current_signals"]
+result_objective = result.get("objective", "sharpe")
 
 current_price = float(df["close"].iloc[-1])
 prev_price    = float(df["close"].iloc[-2])
@@ -537,38 +560,66 @@ with col_sig:
 # ── ROW 2: Performance metrics ────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<hr class="dim">', unsafe_allow_html=True)
+_obj_display_name = OBJ_LABELS.get(result_objective, "sharpe ratio").title()
 st.markdown(
-    '<div class="card-label" style="font-size:11px;margin-bottom:10px;">'
-    'PERFORMANCE METRICS — 2-YEAR BACKTEST</div>',
+    f'<div class="card-label" style="font-size:11px;margin-bottom:10px;">'
+    f'PERFORMANCE METRICS — 2-YEAR BACKTEST'
+    f'<span style="color:#58a6ff;margin-left:10px;">· OPTIMISED FOR {_obj_display_name.upper()}</span>'
+    f'</div>',
     unsafe_allow_html=True,
 )
 
 m1, m2, m3, m4 = st.columns(4, gap="medium")
 
-tr  = metrics["total_return"]
-sr  = metrics["sharpe"]
-wr  = metrics["win_rate"]
-mdd = metrics["max_drawdown"]
+tr      = metrics["total_return"]
+ann_ret = metrics["annual_return"]
+sr      = metrics["sharpe"]
+sortino = metrics["sortino"]
+calmar  = metrics["calmar"]
+wr      = metrics["win_rate"]
+mdd     = metrics["max_drawdown"]
 
-def _metric_card(label: str, value_str: str, css_class: str) -> str:
+def _metric_card(label: str, value_str: str, css_class: str, badge: str = "") -> str:
+    badge_html = (
+        f'<div style="font-size:9px;color:#58a6ff;margin-top:4px;letter-spacing:1px;">'
+        f'{badge}</div>'
+    ) if badge else ""
     return (
         f'<div class="card" style="text-align:center;">'
         f'<div class="card-label">{label}</div>'
         f'<div class="card-value {css_class}">{value_str}</div>'
+        f'{badge_html}'
         f'</div>'
     )
 
+# Card 1 — Total return (always shown)
 with m1:
     st.markdown(
         _metric_card("Total Return", f"{tr:+.1%}", "pos" if tr >= 0 else "neg"),
         unsafe_allow_html=True,
     )
+
+# Card 2 — Optimised metric (dynamic)
 with m2:
-    sr_cls = "pos" if sr > 1 else ("neg" if sr < 0 else "neut")
-    st.markdown(_metric_card("Sharpe Ratio", f"{sr:.2f}", sr_cls), unsafe_allow_html=True)
+    if result_objective == "sortino":
+        s_cls = "pos" if sortino > 1 else ("neg" if sortino < 0 else "neut")
+        st.markdown(_metric_card("Sortino Ratio", f"{sortino:.2f}", s_cls, "OPTIMISED"), unsafe_allow_html=True)
+    elif result_objective == "calmar":
+        c_cls = "pos" if calmar > 1 else ("neg" if calmar < 0 else "neut")
+        st.markdown(_metric_card("Calmar Ratio", f"{calmar:.2f}", c_cls, "OPTIMISED"), unsafe_allow_html=True)
+    elif result_objective == "annual_return":
+        a_cls = "pos" if ann_ret >= 0 else "neg"
+        st.markdown(_metric_card("Annual Return", f"{ann_ret:+.1%}", a_cls, "OPTIMISED"), unsafe_allow_html=True)
+    else:  # sharpe (default)
+        sr_cls = "pos" if sr > 1 else ("neg" if sr < 0 else "neut")
+        st.markdown(_metric_card("Sharpe Ratio", f"{sr:.2f}", sr_cls, "OPTIMISED"), unsafe_allow_html=True)
+
+# Card 3 — Win rate (always shown)
 with m3:
     wr_cls = "pos" if wr >= 0.5 else ("neg" if wr < 0.4 else "neut")
     st.markdown(_metric_card("Win Rate", f"{wr:.1%}", wr_cls), unsafe_allow_html=True)
+
+# Card 4 — Max drawdown (always shown)
 with m4:
     st.markdown(_metric_card("Max Drawdown", f"{mdd:.1%}", "neg"), unsafe_allow_html=True)
 

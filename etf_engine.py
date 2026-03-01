@@ -2,7 +2,7 @@
 ETF Regime Trading Engine
 ─────────────────────────
 Gaussian HMM regime detection (5-state → bullish/neutral/bearish),
-technical signal computation, weight optimization (max Sharpe),
+technical signal computation, weight optimization,
 backtesting, and trade blotter generation.
 """
 
@@ -30,6 +30,14 @@ REGIME_PALETTE = {
     "bearish": "#f85149",
 }
 
+# Labels used in progress messages and UI
+OBJ_LABELS = {
+    "sharpe":        "Sharpe ratio",
+    "sortino":       "Sortino ratio",
+    "calmar":        "Calmar ratio",
+    "annual_return": "annual return",
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Data Fetching
 # ──────────────────────────────────────────────────────────────────────────────
@@ -38,7 +46,6 @@ def fetch_data(ticker: str, period: str = "3y") -> pd.DataFrame:
     """Download OHLCV via yfinance Ticker.history (robust to yf API changes)."""
     t = yf.Ticker(ticker)
     df = t.history(period=period, auto_adjust=True)
-    # Strip timezone so all indices are tz-naive
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
     df.columns = [c.lower() for c in df.columns]
@@ -84,9 +91,9 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
       - vol_volatility: rolling std of volume pct-change  — volume regime
     """
     d = df.copy()
-    d["returns"]     = d["close"].pct_change()
-    d["norm_range"]  = (d["high"] - d["low"]) / d["close"]
-    d["vol_vol"]     = d["volume"].pct_change().rolling(5, min_periods=3).std()
+    d["returns"]    = d["close"].pct_change()
+    d["norm_range"] = (d["high"] - d["low"]) / d["close"]
+    d["vol_vol"]    = d["volume"].pct_change().rolling(5, min_periods=3).std()
     features = (
         d[["returns", "norm_range", "vol_vol"]]
         .replace([np.inf, -np.inf], np.nan)
@@ -104,7 +111,7 @@ def fit_hmm(
     n_components: int = 5,
 ) -> tuple[hmm.GaussianHMM, pd.Series, dict, StandardScaler]:
     """
-    Fit a GaussianHMM with *n_components* states on standardised features.
+    Fit a GaussianHMM with n_components states on standardised features.
     States are ranked by mean return and mapped:
       rank 0-1  → bullish
       rank 2    → neutral
@@ -125,7 +132,6 @@ def fit_hmm(
     model.fit(X)
     states = model.predict(X)
 
-    # Rank states by their mean *unscaled* daily return
     raw_returns = features["returns"].values
     mean_ret_by_state = {
         s: raw_returns[states == s].mean() if (states == s).any() else 0.0
@@ -151,7 +157,7 @@ def fit_hmm(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Technical Signals  (each returns a Series in roughly [-1, +1])
+# Technical Signals  (each normalised to roughly [-1, +1], +1 = bullish)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _zscore(series: pd.Series, window: int = 126, min_p: int = 30) -> pd.Series:
@@ -159,6 +165,8 @@ def _zscore(series: pd.Series, window: int = 126, min_p: int = 30) -> pd.Series:
     sig = series.rolling(window, min_periods=min_p).std()
     return ((series - mu) / (sig + 1e-10)).clip(-3, 3) / 3
 
+
+# ── Original five signals ─────────────────────────────────────────────────────
 
 def signal_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
     """RSI normalised: oversold → +1 (buy), overbought → -1 (sell)."""
@@ -199,7 +207,7 @@ def signal_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm  = pd.Series(plus_dm,  index=high.index)
     minus_dm = pd.Series(minus_dm, index=high.index)
 
-    alpha = 1 / period
+    alpha    = 1 / period
     atr      = tr.ewm(alpha=alpha, adjust=False).mean()
     plus_di  = 100 * plus_dm.ewm( alpha=alpha, adjust=False).mean() / (atr + 1e-10)
     minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / (atr + 1e-10)
@@ -219,14 +227,74 @@ def signal_ema(prices: pd.Series, fast: int = 12, slow: int = 26, sig_p: int = 9
     return _zscore(hist)
 
 
+# ── Three new signals ─────────────────────────────────────────────────────────
+
+def signal_stochastic(df: pd.DataFrame, period: int = 14, smooth: int = 3) -> pd.Series:
+    """
+    Stochastic %K (smoothed): price position within the recent high/low range.
+    High value = price near n-day high → bullish momentum signal.
+    Normalised to [-1, +1] where 0 = midrange (neutral).
+    """
+    low_n   = df["low"].rolling(period,  min_periods=period  // 2).min()
+    high_n  = df["high"].rolling(period, min_periods=period  // 2).max()
+    stoch_k = (df["close"] - low_n) / (high_n - low_n + 1e-10) * 100
+    stoch_d = stoch_k.rolling(smooth, min_periods=1).mean()    # smooth (%D line)
+    return ((stoch_d - 50) / 50).clip(-1, 1).rename("stochastic")
+
+
+def signal_bollinger(prices: pd.Series, period: int = 20, n_std: float = 2.0) -> pd.Series:
+    """
+    Bollinger Band %B: position of price within the volatility envelope.
+    Above upper band → +1 (breakout / strong trend).
+    Below lower band → -1 (breakdown / weak trend).
+    Normalised: midband = 0, ±1 band = ±1.
+    """
+    mid   = prices.rolling(period, min_periods=period // 2).mean()
+    sigma = prices.rolling(period, min_periods=period // 2).std()
+    upper = mid + n_std * sigma
+    lower = mid - n_std * sigma
+    pct_b = (prices - lower) / (upper - lower + 1e-10)   # 0.5 at midband
+    return ((2 * pct_b - 1)).clip(-1.5, 1.5).div(1.5).rename("bollinger")
+
+
+def signal_cmf(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """
+    Chaikin Money Flow (CMF): volume-weighted buying/selling pressure.
+    Positive → accumulation (bullish), Negative → distribution (bearish).
+    Naturally bounded in [-1, +1] by construction.
+    Adds a volume dimension that all five price-only signals lack.
+    """
+    hl_range = df["high"] - df["low"]
+    mf_mult  = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / (hl_range + 1e-10)
+    mf_vol   = mf_mult * df["volume"]
+    vol_sum  = df["volume"].rolling(period, min_periods=period // 2).sum()
+    cmf      = mf_vol.rolling(period, min_periods=period // 2).sum() / (vol_sum + 1e-10)
+    return cmf.clip(-1, 1).rename("cmf")
+
+
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute all five signals and return a clean DataFrame."""
+    """
+    Compute all eight signals and return a clean aligned DataFrame.
+
+    Signal inventory:
+      rsi        — momentum/overbought-oversold (price smoothed)
+      momentum   — 20-day return z-score (trend)
+      volatility — inverse realised-vol z-score (risk environment)
+      adx        — directional trend strength
+      ema        — MACD histogram z-score (trend/momentum)
+      stochastic — %K in recent high/low range (short-term momentum)
+      bollinger  — %B position within Bollinger Bands (breakout/mean-rev)
+      cmf        — Chaikin Money Flow (volume-price pressure)
+    """
     s = pd.DataFrame(index=df.index)
     s["rsi"]        = signal_rsi(df["close"])
     s["momentum"]   = signal_momentum(df["close"])
     s["volatility"] = signal_volatility(df["close"])
     s["adx"]        = signal_adx(df)
     s["ema"]        = signal_ema(df["close"])
+    s["stochastic"] = signal_stochastic(df)
+    s["bollinger"]  = signal_bollinger(df["close"])
+    s["cmf"]        = signal_cmf(df)
     return s.replace([np.inf, -np.inf], np.nan).dropna()
 
 
@@ -260,14 +328,13 @@ def backtest(
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
     n         = len(idx)
-    reg_arr   = regimes.loc[idx].values           # object array (strings)
-    sig_arr   = signals.loc[idx].values           # float64 (n, n_signals)
-    close_arr = df.loc[idx, "close"].values       # float64 (n,)
+    reg_arr   = regimes.loc[idx].values         # object array (strings)
+    sig_arr   = signals.loc[idx].values         # float64 (n, n_signals)
+    close_arr = df.loc[idx, "close"].values     # float64 (n,)
 
     w        = _normalise_weights(weights)
-    comp_arr = sig_arr @ w                        # composite score per day
+    comp_arr = sig_arr @ w
 
-    # State-machine loop — numpy indexing, no pandas overhead
     pos_arr  = np.zeros(n, dtype=np.float64)
     in_trade = False
     for i in range(1, n):
@@ -277,17 +344,14 @@ def backtest(
                 pos_arr[i] = 1.0
         else:
             if reg_arr[i] == "bearish":
-                in_trade = False          # pos_arr[i] stays 0.0
+                in_trade = False
             else:
                 pos_arr[i] = 1.0
 
-    # Strategy return[i] = position[i-1] × pct_return[i]
-    pct_ret  = np.diff(close_arr) / (close_arr[:-1] + 1e-10)   # length n-1
-    strat_ret = pos_arr[:-1] * pct_ret                          # length n-1
+    pct_ret   = np.diff(close_arr) / (close_arr[:-1] + 1e-10)
+    strat_ret = pos_arr[:-1] * pct_ret
 
-    strategy_returns = pd.Series(strat_ret, index=idx[1:])
-    position         = pd.Series(pos_arr,   index=idx)
-    return strategy_returns, position
+    return pd.Series(strat_ret, index=idx[1:]), pd.Series(pos_arr, index=idx)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -295,25 +359,56 @@ def backtest(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_metrics(strategy_returns: pd.Series) -> dict:
+    """
+    Returns a dict with six metrics:
+      total_return  — cumulative return over the period
+      annual_return — CAGR-like: mean daily return × 252
+      sharpe        — annualised Sharpe ratio (rf = 0)
+      sortino       — annualised Sortino ratio (downside deviation only)
+      calmar        — annual return / |max drawdown|
+      win_rate      — fraction of active trading days with positive return
+      max_drawdown  — peak-to-trough drawdown (negative number)
+    """
     if len(strategy_returns) < 5:
-        return dict(total_return=0.0, sharpe=0.0, win_rate=0.0, max_drawdown=0.0)
+        return dict(
+            total_return=0.0, annual_return=0.0,
+            sharpe=0.0, sortino=0.0, calmar=0.0,
+            win_rate=0.0, max_drawdown=0.0,
+        )
 
     total_return = float((1 + strategy_returns).prod() - 1)
     ann_ret      = float(strategy_returns.mean() * 252)
-    ann_vol      = float(strategy_returns.std() * np.sqrt(252))
+    ann_vol      = float(strategy_returns.std()  * np.sqrt(252))
     sharpe       = ann_ret / (ann_vol + 1e-10)
 
-    active       = strategy_returns[strategy_returns != 0]
-    win_rate     = float((active > 0).mean()) if len(active) > 0 else 0.0
+    # Sortino: penalise only negative-return days
+    downside = strategy_returns[strategy_returns < 0]
+    down_vol = float(downside.std() * np.sqrt(252)) if len(downside) > 1 else 1e-10
+    sortino  = ann_ret / (down_vol + 1e-10)
 
-    cum          = (1 + strategy_returns).cumprod()
-    max_dd       = float(((cum - cum.cummax()) / (cum.cummax() + 1e-10)).min())
+    # Max drawdown
+    cum    = (1 + strategy_returns).cumprod()
+    max_dd = float(((cum - cum.cummax()) / (cum.cummax() + 1e-10)).min())
 
-    return dict(total_return=total_return, sharpe=sharpe, win_rate=win_rate, max_drawdown=max_dd)
+    # Calmar: rewards return, penalises drawdown
+    calmar = ann_ret / (abs(max_dd) + 1e-10)
+
+    active   = strategy_returns[strategy_returns != 0]
+    win_rate = float((active > 0).mean()) if len(active) > 0 else 0.0
+
+    return dict(
+        total_return=total_return,
+        annual_return=ann_ret,
+        sharpe=sharpe,
+        sortino=sortino,
+        calmar=calmar,
+        win_rate=win_rate,
+        max_drawdown=max_dd,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Weight Optimisation  (maximise Sharpe over 1-year window)
+# Weight Optimisation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def optimize_weights(
@@ -321,26 +416,32 @@ def optimize_weights(
     regimes: pd.Series,
     signals: pd.DataFrame,
     n_random: int = 6,
+    objective: str = "sharpe",
 ) -> np.ndarray:
     """
-    Nelder-Mead with structured + random restarts to maximise Sharpe.
+    Nelder-Mead with structured + random restarts.
 
-    Starting points:
-      - equal weight across all signals
-      - one-hot for each individual signal  (n_signals points)
-      - n_random random draws from Exponential
-    Total starts = 1 + n_signals + n_random  (default: 12 for 5 signals)
-    Each start is capped at 150 iterations — fast with the vectorised backtest.
+    objective : one of "sharpe" | "sortino" | "calmar" | "annual_return"
+                Determines which metric is maximised during weight search.
+
+    Starting points (15 total for 8 signals):
+      - equal weight across all signals                      (1 point)
+      - one-hot for each individual signal              (n_signals points)
+      - n_random random draws from Exponential distribution  (6 points)
+    Each start is capped at 150 iterations.
     """
+    _valid_obj = {"sharpe", "sortino", "calmar", "annual_return"}
+    obj_key    = objective if objective in _valid_obj else "sharpe"
+
     n_sig        = signals.shape[1]
-    best_sharpe  = -np.inf
+    best_score   = -np.inf
     best_weights = np.ones(n_sig) / n_sig
 
-    def objective(w: np.ndarray) -> float:
+    def loss(w: np.ndarray) -> float:
         sr, _ = backtest(df, regimes, signals, w)
-        return -compute_metrics(sr)["sharpe"]
+        return -compute_metrics(sr).get(obj_key, 0.0)
 
-    # Structured starts: equal weight + each signal in isolation
+    # Structured starts
     structured: list[np.ndarray] = [np.ones(n_sig) / n_sig]
     for i in range(n_sig):
         w = np.zeros(n_sig)
@@ -348,23 +449,19 @@ def optimize_weights(
         structured.append(w)
 
     # Random starts
-    rng = np.random.default_rng(42)
+    rng     = np.random.default_rng(42)
     randoms = [rng.exponential(1.0, n_sig) for _ in range(n_random)]
 
     for x0 in structured + randoms:
         x0 = np.abs(x0)
         x0 /= x0.sum() + 1e-10
         try:
-            res = minimize(
-                objective,
-                x0,
-                method="Nelder-Mead",
-                options={"maxiter": 150, "xatol": 1e-3, "fatol": 1e-3},
-            )
+            res       = minimize(loss, x0, method="Nelder-Mead",
+                                 options={"maxiter": 150, "xatol": 1e-3, "fatol": 1e-3})
             candidate = _normalise_weights(res.x)
-            sharpe    = -res.fun
-            if sharpe > best_sharpe:
-                best_sharpe  = sharpe
+            score     = -res.fun
+            if score > best_score:
+                best_score   = score
                 best_weights = candidate
         except Exception:
             pass
@@ -397,16 +494,15 @@ def generate_trades(df: pd.DataFrame, position: pd.Series) -> pd.DataFrame:
             pnl      = (price - entry_price) / (entry_price + 1e-10)
             days     = (date - entry_date).days
             trades.append({
-                "Entry Date":     entry_date.strftime("%Y-%m-%d"),
-                "Exit Date":      date.strftime("%Y-%m-%d"),
-                "Days Held":      days,
-                "Entry Price":    round(entry_price, 2),
-                "Exit Price":     round(price, 2),
-                "Return (%)":     round(pnl * 100, 2),
-                "Result":         "Win" if pnl > 0 else "Loss",
+                "Entry Date":  entry_date.strftime("%Y-%m-%d"),
+                "Exit Date":   date.strftime("%Y-%m-%d"),
+                "Days Held":   days,
+                "Entry Price": round(entry_price, 2),
+                "Exit Price":  round(price, 2),
+                "Return (%)":  round(pnl * 100, 2),
+                "Result":      "Win" if pnl > 0 else "Loss",
             })
 
-    # Still open position
     if in_trade and entry_price is not None:
         current = float(df["close"].iloc[-1])
         pnl     = (current - entry_price) / (entry_price + 1e-10)
@@ -430,18 +526,22 @@ def generate_trades(df: pd.DataFrame, position: pd.Series) -> pd.DataFrame:
 # Main Pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_analysis(ticker: str, _progress=None) -> dict | None:
+def run_analysis(
+    ticker: str,
+    _progress=None,
+    objective: str = "sharpe",
+) -> dict | None:
     """
     Full pipeline for one ETF ticker.
 
     _progress : optional callable(pct: int, msg: str) for live UI updates.
-                The leading underscore tells Streamlit's @st.cache_data to
-                exclude this argument from the cache key, so the same cached
-                result is served regardless of which callback is passed.
+    objective : optimisation target — "sharpe" | "sortino" | "calmar" | "annual_return"
     """
     def _upd(pct: int, msg: str) -> None:
         if _progress is not None:
             _progress(pct, msg)
+
+    obj_label = OBJ_LABELS.get(objective, "Sharpe ratio")
 
     try:
         _upd(5,  f"Downloading {ticker} price history (3 years)…")
@@ -455,7 +555,7 @@ def run_analysis(ticker: str, _progress=None) -> dict | None:
         _upd(30, "Fitting Gaussian HMM · 5 hidden states…")
         model, regimes, regime_map, scaler = fit_hmm(features)
 
-        _upd(45, "Computing signals: RSI · Momentum · Vol · ADX · EMA…")
+        _upd(45, "Computing signals: RSI · Momentum · Vol · ADX · EMA · Stoch · Bollinger · CMF…")
         signals = compute_signals(df)
 
         # ── 2-year lookback window ─────────────────────────────────────────
@@ -467,8 +567,8 @@ def run_analysis(ticker: str, _progress=None) -> dict | None:
         if len(df_lb) < 60:
             return None
 
-        _upd(58, "Optimising signal weights · maximising Sharpe ratio…")
-        weights = optimize_weights(df_lb, regimes_lb, signals_lb)
+        _upd(58, f"Optimising signal weights · maximising {obj_label}…")
+        weights = optimize_weights(df_lb, regimes_lb, signals_lb, objective=objective)
 
         _upd(82, "Backtesting strategy on 2-year window…")
         strat_returns, position = backtest(df_lb, regimes_lb, signals_lb, weights)
@@ -492,13 +592,14 @@ def run_analysis(ticker: str, _progress=None) -> dict | None:
             recommendation = "BUY" if composite > 0.10 else "NEUTRAL"
         elif current_regime == "bearish":
             recommendation = "SELL"
-        else:  # neutral — check transition probability
+        else:
             recommendation = "SELL" if bearish_prob >= 0.40 else "NEUTRAL"
 
         _upd(100, "Analysis complete.")
 
         return {
             "ticker":          ticker,
+            "objective":       objective,
             "df":              df,
             "df_lb":           df_lb,
             "regimes":         regimes,
