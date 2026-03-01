@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 
 from etf_engine import (
     ETF_UNIVERSE,
@@ -658,93 +657,90 @@ def build_price_chart(
     regimes_1y: pd.Series,
     position: pd.Series,
 ) -> go.Figure:
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.02,
-        row_heights=[0.72, 0.28],
-    )
+    fig = go.Figure()
 
-    # ── Candlestick ──────────────────────────────────────────────────────────
-    fig.add_trace(
-        go.Candlestick(
+    # ── Bollinger Bands (20d, 2σ) — draw first so candles sit on top ─────────
+    bb_mid   = df_1y["close"].rolling(20, min_periods=10).mean()
+    bb_sigma = df_1y["close"].rolling(20, min_periods=10).std()
+    bb_upper = bb_mid + 2 * bb_sigma
+    bb_lower = bb_mid - 2 * bb_sigma
+
+    fig.add_trace(go.Scatter(
+        x=df_1y.index, y=bb_lower,
+        line=dict(color="rgba(188,140,255,0.28)", width=1),
+        name="BB Lower", showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_1y.index, y=bb_upper,
+        line=dict(color="rgba(188,140,255,0.28)", width=1),
+        fill="tonexty", fillcolor="rgba(188,140,255,0.055)",
+        name="BB (20d, 2σ)", hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_1y.index, y=bb_mid,
+        line=dict(color="rgba(188,140,255,0.45)", width=1, dash="dot"),
+        name="SMA 20", showlegend=False, hoverinfo="skip",
+    ))
+
+    # ── EMA overlays (20 + 50 — standard trader pair) ─────────────────────────
+    for span, col in [(20, "#58a6ff"), (50, "#d29922")]:
+        fig.add_trace(go.Scatter(
             x=df_1y.index,
-            open=df_1y["open"], high=df_1y["high"],
-            low=df_1y["low"],   close=df_1y["close"],
-            name="OHLC",
-            increasing=dict(line=dict(color="#3fb950", width=1), fillcolor="#3fb950"),
-            decreasing=dict(line=dict(color="#f85149", width=1), fillcolor="#f85149"),
-            whiskerwidth=0.3,
-        ),
-        row=1, col=1,
+            y=df_1y["close"].ewm(span=span, adjust=False).mean(),
+            name=f"EMA {span}",
+            line=dict(color=col, width=1.3),
+            opacity=0.9, hoverinfo="skip",
+        ))
+
+    # ── Candlestick — rendered above all overlays ─────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=df_1y.index,
+        open=df_1y["open"], high=df_1y["high"],
+        low=df_1y["low"],   close=df_1y["close"],
+        name="OHLC",
+        increasing=dict(line=dict(color="#3fb950", width=1), fillcolor="#3fb950"),
+        decreasing=dict(line=dict(color="#f85149", width=1), fillcolor="#f85149"),
+        whiskerwidth=0.3,
+    ))
+
+    # ── Current price dotted line ─────────────────────────────────────────────
+    last_close = float(df_1y["close"].iloc[-1])
+    fig.add_hline(
+        y=last_close,
+        line=dict(color="#e6edf3", width=1, dash="dot"),
+        opacity=0.55,
+        annotation_text=f"  ${last_close:,.2f}",
+        annotation_position="right",
+        annotation_font=dict(size=11, color="#e6edf3"),
     )
 
-    # ── EMA overlays ─────────────────────────────────────────────────────────
-    ema_params = [(12, "#58a6ff", "solid", 1.2), (26, "#d29922", "solid", 1.2), (50, "#bc8cff", "dot", 1.0)]
-    for span, col, dash, width in ema_params:
-        fig.add_trace(
-            go.Scatter(
-                x=df_1y.index,
-                y=df_1y["close"].ewm(span=span, adjust=False).mean(),
-                name=f"EMA {span}",
-                line=dict(color=col, width=width, dash=dash),
-                opacity=0.85,
-                hoverinfo="skip",
-            ),
-            row=1, col=1,
-        )
-
-    # ── Entry / exit markers ─────────────────────────────────────────────────
-    pos_r = position.reindex(df_1y.index).fillna(0.0)
-    prev  = pos_r.shift(1, fill_value=0.0)
+    # ── Entry / exit markers ──────────────────────────────────────────────────
+    pos_r   = position.reindex(df_1y.index).fillna(0.0)
+    prev    = pos_r.shift(1, fill_value=0.0)
     entries = pos_r.index[(pos_r == 1.0) & (prev == 0.0)]
     exits   = pos_r.index[(pos_r == 0.0) & (prev == 1.0)]
 
     if len(entries):
-        fig.add_trace(
-            go.Scatter(
-                x=entries,
-                y=df_1y.loc[entries, "low"] * 0.988,
-                mode="markers",
-                name="Entry ▲",
-                marker=dict(symbol="triangle-up", size=11, color="#3fb950",
-                            line=dict(color="#e6edf3", width=0.5)),
-                hovertemplate="Entry: %{x|%Y-%m-%d}<extra></extra>",
-            ),
-            row=1, col=1,
-        )
+        fig.add_trace(go.Scatter(
+            x=entries,
+            y=df_1y.loc[entries, "low"] * 0.986,
+            mode="markers",
+            name="Entry ▲",
+            marker=dict(symbol="triangle-up", size=13, color="#3fb950",
+                        line=dict(color="#e6edf3", width=0.8)),
+            hovertemplate="Entry: %{x|%Y-%m-%d}<extra></extra>",
+        ))
 
     if len(exits):
-        fig.add_trace(
-            go.Scatter(
-                x=exits,
-                y=df_1y.loc[exits, "high"] * 1.012,
-                mode="markers",
-                name="Exit ▼",
-                marker=dict(symbol="triangle-down", size=11, color="#f85149",
-                            line=dict(color="#e6edf3", width=0.5)),
-                hovertemplate="Exit: %{x|%Y-%m-%d}<extra></extra>",
-            ),
-            row=1, col=1,
-        )
-
-    # ── Volume bars ───────────────────────────────────────────────────────────
-    vol_colors = [
-        "#3fb950" if c >= o else "#f85149"
-        for c, o in zip(df_1y["close"], df_1y["open"])
-    ]
-    fig.add_trace(
-        go.Bar(
-            x=df_1y.index,
-            y=df_1y["volume"],
-            name="Volume",
-            marker_color=vol_colors,
-            marker_opacity=0.55,
-            showlegend=False,
-            hovertemplate="Vol: %{y:,.0f}<extra></extra>",
-        ),
-        row=2, col=1,
-    )
+        fig.add_trace(go.Scatter(
+            x=exits,
+            y=df_1y.loc[exits, "high"] * 1.014,
+            mode="markers",
+            name="Exit ▼",
+            marker=dict(symbol="triangle-down", size=13, color="#f85149",
+                        line=dict(color="#e6edf3", width=0.8)),
+            hovertemplate="Exit: %{x|%Y-%m-%d}<extra></extra>",
+        ))
 
     # ── Regime shading ────────────────────────────────────────────────────────
     _regime_shading(fig, regimes_1y)
@@ -754,8 +750,8 @@ def build_price_chart(
         template="plotly_dark",
         paper_bgcolor="#0d1117",
         plot_bgcolor="#0d1117",
-        height=560,
-        margin=dict(l=10, r=10, t=10, b=10),
+        height=580,
+        margin=dict(l=10, r=70, t=10, b=10),
         legend=dict(
             orientation="h", y=1.01, x=0,
             bgcolor="rgba(0,0,0,0)",
@@ -763,11 +759,9 @@ def build_price_chart(
         ),
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        xaxis2=dict(showgrid=True,  gridcolor="#1c2128"),
-        yaxis =dict(showgrid=True,  gridcolor="#1c2128", side="right", tickprefix="$"),
-        yaxis2=dict(showgrid=False, side="right", showticklabels=False),
+        xaxis=dict(showgrid=True, gridcolor="#1c2128", zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="#1c2128", side="right", tickprefix="$"),
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#1c2128", zeroline=False)
 
     return fig
 
@@ -778,13 +772,16 @@ st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": True,
 # ── Regime legend key ─────────────────────────────────────────────────────────
 st.markdown(
     """
-    <div style="display:flex;gap:20px;margin-top:-8px;margin-bottom:4px;font-size:11px;color:#8b949e;">
+    <div style="display:flex;flex-wrap:wrap;gap:18px;margin-top:-8px;margin-bottom:4px;font-size:11px;color:#8b949e;">
         <span><span style="display:inline-block;width:12px;height:12px;background:rgba(0,200,100,0.30);
               border-radius:2px;margin-right:4px;"></span>Bullish regime</span>
         <span><span style="display:inline-block;width:12px;height:12px;background:rgba(255,80,80,0.30);
               border-radius:2px;margin-right:4px;"></span>Bearish regime</span>
         <span><span style="display:inline-block;width:12px;height:12px;background:rgba(210,153,34,0.20);
               border-radius:2px;margin-right:4px;"></span>Neutral regime</span>
+        <span style="color:#bc8cff;">▬ Bollinger Bands (20d, 2σ)</span>
+        <span style="color:#58a6ff;">▬ EMA 20</span>
+        <span style="color:#d29922;">▬ EMA 50</span>
     </div>
     """,
     unsafe_allow_html=True,
