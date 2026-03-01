@@ -469,49 +469,48 @@ bull_pct = (regimes_lb == "bullish").mean() * 100
 bear_pct = (regimes_lb == "bearish").mean() * 100
 neut_pct = (regimes_lb == "neutral").mean() * 100
 
-bp_pct      = bearish_prob * 100
-bp_color    = "#f85149" if bearish_prob >= 0.30 else ("#d29922" if bearish_prob >= 0.15 else "#8b949e")
-bp_label    = "HIGH — exit risk elevated" if bearish_prob >= 0.30 else (
-              "MODERATE" if bearish_prob >= 0.15 else "LOW")
-show_bp_bar = current_regime in ("neutral", "bearish")
-bp_html     = (
-    f"""
-    <hr class="dim">
-    <div class="card-label">BEARISH TRANSITION PROBABILITY</div>
-    <div style="margin-top:6px;">
-        <div style="background:#21262d;border-radius:4px;height:7px;overflow:hidden;">
-            <div style="width:{min(bp_pct,100):.0f}%;height:100%;background:{bp_color};
-                        border-radius:4px;transition:width .4s;"></div>
-        </div>
-        <div style="display:flex;justify-content:space-between;margin-top:4px;">
-            <span style="font-size:11px;color:{bp_color};">{bp_label}</span>
-            <span style="font-size:11px;color:#e6edf3;font-family:monospace;">{bp_pct:.0f}%</span>
-        </div>
-    </div>
-    """
-    if show_bp_bar else ""
+bp_pct   = bearish_prob * 100
+bp_color = "#f85149" if bearish_prob >= 0.30 else ("#d29922" if bearish_prob >= 0.15 else "#8b949e")
+bp_label = "HIGH — exit risk elevated" if bearish_prob >= 0.30 else (
+           "MODERATE" if bearish_prob >= 0.15 else "LOW")
+
+# ── IMPORTANT: Streamlit's st.markdown runs content through a Markdown parser
+# before rendering HTML. Any line with ≥ 4 spaces of leading whitespace is
+# treated as a Markdown code block, so closing </div> tags on indented lines
+# render as literal text. Fix: build HTML via single-line string concatenation
+# so no line has leading whitespace. Never use multiline f-strings with deep
+# indentation for HTML passed to st.markdown(unsafe_allow_html=True).
+bp_html = (
+    f'<hr class="dim">'
+    f'<div class="card-label">BEARISH TRANSITION PROBABILITY</div>'
+    f'<div style="margin-top:6px;">'
+    f'<div style="background:#21262d;border-radius:4px;height:7px;overflow:hidden;">'
+    f'<div style="width:{min(bp_pct,100):.0f}%;height:100%;background:{bp_color};'
+    f'border-radius:4px;transition:width .4s;"></div>'
+    f'</div>'
+    f'<div style="display:flex;justify-content:space-between;margin-top:4px;">'
+    f'<span style="font-size:11px;color:{bp_color};">{bp_label}</span>'
+    f'<span style="font-size:11px;color:#e6edf3;font-family:monospace;">{bp_pct:.0f}%</span>'
+    f'</div>'
+    f'</div>'
 )
 
 with col_reg:
     st.markdown(
-        f"""
-        <div class="card">
-            <div class="card-label">CURRENT MARKET REGIME</div>
-            <div style="margin:10px 0 12px;">
-                <span class="rbadge rbadge-{current_regime}">
-                    {current_regime.upper()}
-                </span>
-            </div>
-            <hr class="dim">
-            <div class="card-label">2-Year Regime Distribution</div>
-            <div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;">
-                <span style="color:#3fb950;font-size:12px;">▲ Bull {bull_pct:.0f}%</span>
-                <span style="color:#d29922;font-size:12px;">◆ Neut {neut_pct:.0f}%</span>
-                <span style="color:#f85149;font-size:12px;">▼ Bear {bear_pct:.0f}%</span>
-            </div>
-            {bp_html}
-        </div>
-        """,
+        f'<div class="card">'
+        f'<div class="card-label">CURRENT MARKET REGIME</div>'
+        f'<div style="margin:10px 0 12px;">'
+        f'<span class="rbadge rbadge-{current_regime}">{current_regime.upper()}</span>'
+        f'</div>'
+        f'<hr class="dim">'
+        f'<div class="card-label">2-Year Regime Distribution</div>'
+        f'<div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;">'
+        f'<span style="color:#3fb950;font-size:12px;">▲ Bull {bull_pct:.0f}%</span>'
+        f'<span style="color:#d29922;font-size:12px;">◆ Neut {neut_pct:.0f}%</span>'
+        f'<span style="color:#f85149;font-size:12px;">▼ Bear {bear_pct:.0f}%</span>'
+        f'</div>'
+        f'{bp_html}'
+        f'</div>',
         unsafe_allow_html=True,
     )
 

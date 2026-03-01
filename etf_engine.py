@@ -584,9 +584,12 @@ def run_analysis(
         w_norm           = _normalise_weights(weights)
         composite        = float(current_sig_vals @ w_norm)
 
-        last_feat    = features.iloc[[-1]].values
-        X_last       = scaler.transform(last_feat)
-        proba_last   = model.predict_proba(X_last)[0]
+        # Use the FULL sequence for forward-backward so we get the smoothed
+        # posterior at the final time step. Calling predict_proba on a single
+        # observation collapses to π_s × emission_prob(x) which underflows
+        # to 0.0 for bearish states when the current data point looks bullish.
+        X_all        = scaler.transform(features.values)
+        proba_last   = model.predict_proba(X_all)[-1]   # posterior at last time step
         bearish_ids  = [s for s, lbl in regime_map.items() if lbl == "bearish"]
         bearish_prob = float(sum(proba_last[s] for s in bearish_ids))
 
